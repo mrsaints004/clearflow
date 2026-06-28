@@ -1,0 +1,164 @@
+-- | Invoice tokenization contract with full lifecycle.
+-- The seller creates an invoice. Only the seller sees full details.
+-- When an auction is created, lenders see anonymized metadata only.
+-- Supports: creation -> approval -> confirmation -> auction (or dispute path).
+module Invoice where
+
+
+-- | Full invoice data, visible only to the seller and (post-reveal) the winning lender.
+data InvoiceData = InvoiceData
+  with
+    invoiceId     : Text
+    seller        : Party
+    debtorName    : Party       -- Who owes the money (Canton Party, hidden pre-bid)
+    amount        : Decimal     -- Exact amount (hidden pre-bid, shown as bucket)
+    currency      : Text
+    sector        : Text        -- Industry sector (visible pre-bid)
+    paymentTermDays : Int       -- Net 30, 60, 90 (visible pre-bid)
+    issueDate     : Date
+    dueDate       : Date
+    reliabilityScore : Text     -- A, B, C rating of debtor (visible pre-bid)
+  deriving (Eq, Show)
+
+-- | Anonymized metadata that lenders see before bidding.
+-- This is what makes risk pricing possible without revealing the commercial relationship.
+data InvoiceMetadata = InvoiceMetadata
+  with
+    invoiceId       : Text
+    amountBucket    : Text      -- e.g. "10K-50K", "50K-100K", "100K-500K"
+    currency        : Text
+    sector          : Text
+    paymentTermDays : Int
+    reliabilityScore : Text
+  deriving (Eq, Show)
+
+-- | Compute the amount bucket from exact amount.
+toAmountBucket : Decimal -> Text
+toAmountBucket amt
+  | amt < 10000.0    = "Under 10K"
+  | amt < 50000.0    = "10K-50K"
+  | amt < 100000.0   = "50K-100K"
+  | amt < 500000.0   = "100K-500K"
+  | otherwise        = "500K+"
+
+-- | Extract anonymized metadata from full invoice data.
+toMetadata : InvoiceData -> InvoiceMetadata
+toMetadata inv = InvoiceMetadata with
+  invoiceId       = inv.invoiceId
+  amountBucket    = toAmountBucket inv.amount
+  currency        = inv.currency
+  sector          = inv.sector
+  paymentTermDays = inv.paymentTermDays
+  reliabilityScore = inv.reliabilityScore
+
+-- | The invoice token. Only the seller (and platform operator) can see it.
+-- This is the source of truth for the invoice.
+template Invoice
+  with
+    operator  : Party       -- Platform operator
+    seller    : Party       -- The business that issued the invoice
+    invoice   : InvoiceData
+    status    : Text        -- "pending", "verified", "confirmed", "disputed", "in_auction"
+  where
+    signatory operator, seller
+    observer invoice.debtorName  -- Debtor can see invoices where they are the obligor
+
+    -- Operator approves (verifies) the invoice
+    choice Approve : ContractId Invoice
+      controller operator
+      do
+        assertMsg "Invoice must be pending" (status == "pending")
+        create this with status = "verified"
+
+    -- Debtor confirms the obligation
+    choice Confirm : ContractId Invoice
+      controller invoice.debtorName
+      do
+        assertMsg "Invoice must be verified" (status == "verified")
+        create this with status = "confirmed"
+
+    -- Debtor disputes the invoice
+    choice Dispute : ContractId Invoice
+      with
+        reason : Text
+      controller invoice.debtorName
+      do
+        assertMsg "Invoice must be verified or confirmed" (status == "verified" || status == "confirmed")
+        create this with status = "disputed"
+
+    -- Resolve a dispute
+    choice ResolveDispute : ContractId Invoice
+      with
+        resolution : Text  -- "upheld" or "rejected"
+      controller operator
+      do
+        assertMsg "Invoice must be disputed" (status == "disputed")
+        let newStatus = if resolution == "upheld" then "pending" else "confirmed"
+        create this with status = newStatus
+
+    -- Seller can put this invoice up for auction
+    choice CreateAuction : ContractId AuctionInvite
+      with
+        minBidCount : Int   -- Minimum number of bids before auction can close
+      controller seller
+      do
+        assertMsg "Invoice must be confirmed" (status == "confirmed")
+        let metadata = toMetadata invoice
+        create AuctionInvite with
+          operator
+          seller
+          invoiceId = invoice.invoiceId
+          metadata
+          minBidCount
+          status = "open"
+          lenderObservers = []
+
+-- | Auction invite — visible to lenders with anonymized metadata only.
+-- Lenders are added as observers so they can see this contract on their
+-- Canton participant node, but they only see metadata, not the full invoice.
+template AuctionInvite
+  with
+    operator    : Party
+    seller      : Party
+    invoiceId   : Text
+    metadata    : InvoiceMetadata  -- Anonymized data lenders can see
+    minBidCount : Int
+    status      : Text             -- "open", "closed", "settled"
+    lenderObservers : [Party]      -- Lenders who can see this auction
+  where
+    signatory operator, seller
+    observer lenderObservers
+
+    -- Add a lender as observer so they can see this auction on their participant node
+    choice AddLenderObserver : ContractId AuctionInvite
+      with
+        lender : Party
+      controller operator
+      do
+        assertMsg "Lender not already observing" (lender `notElem` lenderObservers)
+        create this with lenderObservers = lender :: lenderObservers
+
+    -- Seller closes the auction (manual trigger for demo pacing)
+    choice CloseAuction : ContractId AuctionInvite
+      with
+        dummy : ()  -- placeholder
+      controller seller
+      do
+        assertMsg "Auction must be open" (status == "open")
+        create this with status = "closed"
+
+-- | Payment notification — tells debtor to redirect payment to the winning lender.
+-- Created after settlement. Debtor and winning lender are observers.
+template PaymentNotification
+  with
+    operator      : Party
+    debtor        : Party           -- Debtor as a Canton party
+    seller        : Party           -- Original payee (seller)
+    winningLender : Party           -- New payee (winning lender)
+    invoiceId     : Text
+    amount        : Decimal
+    dueDate       : Text
+    createdAt     : Text
+  where
+    signatory operator
+    observer debtor, winningLender

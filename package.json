@@ -1,0 +1,21 @@
+{
+  "name": "clearflow",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Provably Private Sealed-Bid Auctions on Canton Network — where competing parties physically cannot see each other's data",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm start",
+    "build": "npm run build:backend && npm run build:frontend",
+    "build:backend": "cd backend && npm run build",
+    "build:frontend": "cd frontend && npm run build",
+    "start": "cd backend && npm start",
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "test": "cd backend && npm test",
+    "test:daml": "daml test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}

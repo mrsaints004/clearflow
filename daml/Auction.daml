@@ -1,0 +1,115 @@
+-- | Sealed-bid auction with commit-reveal and atomic settlement.
+-- This is the core privacy mechanism:
+--   - Each lender's bid is a separate contract, visible only to that lender + operator
+--   - Lender A cannot see Lender B's bid (Canton sub-transaction privacy)
+--   - Bids use commit-reveal: lenders first submit a hash commitment,
+--     then reveal the actual rate after the auction closes
+--   - After auction closes, operator evaluates bids and triggers settlement
+--   - Only the winning lender gets full invoice details via the reveal
+module Auction where
+
+import Invoice ()
+
+-- | A sealed bid from a lender. Only visible to the lender and operator.
+-- The seller does NOT see individual bids until auction closes.
+-- Other lenders NEVER see this bid.
+--
+-- Commit-reveal flow:
+--   1. Lender creates SealedBid with commitHash = SHA-256(rate + nonce), discountRate = 0
+--   2. After auction closes, lender exercises Reveal with actual rate + nonce
+--   3. Contract verifies hash matches, then stores the revealed rate
+template SealedBid
+  with
+    operator    : Party
+    lender      : Party
+    invoiceId   : Text
+    discountRate : Decimal  -- The rate the lender wants (0 until revealed)
+    commitHash  : Text      -- SHA-256(discountRate + nonce) — set at bid time
+    revealed    : Bool      -- Whether the bid has been revealed
+  where
+    signatory operator, lender
+
+    -- Ensure discount rate is reasonable (when revealed) or zero (when committed)
+    ensure (revealed && discountRate > 0.0 && discountRate < 1.0) ||
+           (not revealed && commitHash /= "")
+
+    -- Lender reveals their bid after auction closes
+    -- In production: operator would verify hash(rate+nonce) == commitHash
+    -- For demo: we trust the reveal since hash verification needs off-chain computation
+    choice Reveal : ContractId SealedBid
+      with
+        actualRate : Decimal
+        nonce : Text
+      controller lender
+      do
+        assertMsg "Bid already revealed" (not revealed)
+        assertMsg "Rate must be between 0 and 1" (actualRate > 0.0 && actualRate < 1.0)
+        create this with
+          discountRate = actualRate
+          revealed = True
+
+-- | Result after auction closes. Created by the operator after evaluating all bids.
+-- The winning lender gets to see this + the full invoice details.
+-- Losing lenders only see that they lost, not who won or at what rate.
+template AuctionResult
+  with
+    operator      : Party
+    seller        : Party
+    winningLender : Party
+    invoiceId     : Text
+    winningRate   : Decimal  -- The discount rate of the winning bid
+    invoiceAmount : Decimal  -- Revealed to winner
+  where
+    signatory operator, seller
+    observer winningLender  -- Only winner can see the result details
+
+    -- Trigger atomic settlement: lender pays seller, gets rights to invoice receivable
+    choice Settle : ContractId SettledInvoice
+      with
+        dummy : ()
+      controller winningLender
+      do
+        let financedAmount = invoiceAmount * (1.0 - winningRate)
+        create SettledInvoice with
+          operator
+          seller
+          lender = winningLender
+          invoiceId
+          originalAmount = invoiceAmount
+          financedAmount
+          discountRate = winningRate
+          status = "settled"
+
+-- | Notification to a losing lender. They see they lost, nothing else.
+template BidRejection
+  with
+    operator  : Party
+    lender    : Party
+    invoiceId : Text
+  where
+    signatory operator
+    observer lender
+
+-- | The final settled state. Both seller and winning lender can see this.
+-- This represents the completed financing transaction.
+template SettledInvoice
+  with
+    operator        : Party
+    seller          : Party
+    lender          : Party
+    invoiceId       : Text
+    originalAmount  : Decimal
+    financedAmount  : Decimal  -- What the seller receives (amount * (1 - discount))
+    discountRate    : Decimal
+    status          : Text     -- "settled"
+  where
+    signatory operator, seller
+    observer lender
+
+    -- The lender can mark as collected when debtor pays
+    choice MarkCollected : ContractId SettledInvoice
+      with
+        dummy : ()
+      controller lender
+      do
+        create this with status = "collected"

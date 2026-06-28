@@ -1,0 +1,40 @@
+# Render.com deployment — single service serving both API + frontend
+services:
+  - type: web
+    name: clearflow
+    runtime: node
+    buildCommand: |
+      cd frontend && npm install && npm run build && cd ../backend && npm install && npx tsc && cp -r ../frontend/build ../backend/public
+    startCommand: cd backend && NODE_ENV=production node dist/server.js
+    envVars:
+      - key: PORT
+        value: 3002
+      - key: NODE_ENV
+        value: production
+      - key: APP_SECRET
+        generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: https://clearflow.onrender.com
+      - key: SEAPORT_DEVNET
+        value: "true"
+      - key: LEDGER_API_URL
+        value: https://ledger-api.validator.devnet.sandbox.fivenorth.io
+      - key: SEAPORT_PARTY_ID
+        sync: false
+      - key: SEAPORT_OIDC_ISSUER
+        value: https://auth.sandbox.fivenorth.io/application/o/token/
+      - key: SEAPORT_OIDC_CLIENT_ID
+        value: validator-devnet-m2m
+      - key: SEAPORT_OIDC_CLIENT_SECRET
+        sync: false
+      - key: REQUIRE_AUTH
+        value: "false"
+      - key: OPERATOR_PASSWORD
+        generateValue: true
+    plan: free
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY

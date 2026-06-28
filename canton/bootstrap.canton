@@ -1,0 +1,23 @@
+// Bootstrap script for multi-participant Canton topology
+// Run after the daemon starts with: canton daemon --config topology.conf --bootstrap bootstrap.canton
+
+// Connect all participants to the domain
+participant-operator.domains.connect_local(clearflow-domain)
+participant-1.domains.connect_local(clearflow-domain)
+participant-2.domains.connect_local(clearflow-domain)
+participant-3.domains.connect_local(clearflow-domain)
+
+// Allocate the Operator party on the operator participant.
+// All other parties register dynamically via the application's
+// POST /api/parties/register endpoint, which calls Canton's
+// /v1/parties/allocate on the appropriate participant.
+val operator = participant-operator.parties.enable("Operator")
+
+// Upload the DAR to all participants
+// Each participant needs the Daml code to validate transactions
+participants.all.dars.upload("../.daml/dist/clearflow-0.1.0.dar")
+
+// Print party IDs for backend configuration
+println(s"OPERATOR_PARTY=${operator.toLf}")
+println(s"Canton topology ready: 4 participants connected to clearflow-domain")
+println(s"Participants 1-3 available for dynamic party registration")

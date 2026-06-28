@@ -1,0 +1,261 @@
+-- | End-to-end test script for the full invoice factoring flow.
+-- Verifies: invoice creation -> approve -> confirm -> auction -> sealed bids -> close -> settle
+-- Also verifies privacy: Lender A cannot see Lender B's bid.
+-- Tests commit-reveal flow and dispute handling.
+module Test where
+
+import Invoice
+import Auction
+import Daml.Script
+import DA.Date
+import DA.Optional (isSome, isNone)
+
+fullFlowTest : Script ()
+fullFlowTest = script do
+  -- Setup parties
+  operator <- allocateParty "Operator"
+  seller   <- allocateParty "TestSeller"
+  debtor   <- allocateParty "TestDebtor"
+  lenderA  <- allocateParty "TestLenderA"
+  lenderB  <- allocateParty "TestLenderB"
+  lenderC  <- allocateParty "TestLenderC"
+
+  -- Step 1: Seller creates an invoice (only seller + operator can see it)
+  let invoiceData = InvoiceData with
+        invoiceId       = "INV-2026-001"
+        seller          = seller
+        debtorName      = debtor
+        amount          = 75000.0
+        currency        = "USD"
+        sector          = "Manufacturing"
+        paymentTermDays = 30
+        issueDate       = date 2026 Jun 1
+        dueDate         = date 2026 Jul 1
+        reliabilityScore = "A"
+
+  invoiceCid <- submitMulti [operator, seller] [] do
+    createCmd Invoice with
+      operator
+      seller
+      invoice = invoiceData
+      status = "pending"
+
+  -- Step 2: Operator approves the invoice
+  verifiedCid <- submit operator do
+    exerciseCmd invoiceCid Approve
+
+  -- Step 3: Debtor confirms the obligation (debtor is the controller)
+  confirmedCid <- submit debtor do
+    exerciseCmd verifiedCid Confirm
+
+  -- Step 4: Seller puts invoice up for auction (min 2 bids)
+  auctionCid <- submit seller do
+    exerciseCmd confirmedCid CreateAuction with minBidCount = 2
+
+  -- Step 4b: Operator adds lenders as observers so they can see the auction
+  auctionCid <- submit operator do
+    exerciseCmd auctionCid AddLenderObserver with lender = lenderA
+  auctionCid <- submit operator do
+    exerciseCmd auctionCid AddLenderObserver with lender = lenderB
+  auctionCid <- submit operator do
+    exerciseCmd auctionCid AddLenderObserver with lender = lenderC
+
+  -- PRIVACY CHECK: Lenders should now see the auction invite
+  auctionVisibleToA <- queryContractId lenderA auctionCid
+  assertMsg "Lender A should see auction invite" (isSome auctionVisibleToA)
+
+  -- Step 5: Lenders submit sealed bids with commit-reveal
+  -- Lender A: pre-revealed for simplicity (3% discount)
+  bidA <- submitMulti [operator, lenderA] [] do
+    createCmd SealedBid with
+      operator
+      lender = lenderA
+      invoiceId = "INV-2026-001"
+      discountRate = 0.03
+      commitHash = "a1b2c3d4e5f6"
+      revealed = True
+
+  -- Lender B: pre-revealed (2.5% discount — better for seller)
+  bidB <- submitMulti [operator, lenderB] [] do
+    createCmd SealedBid with
+      operator
+      lender = lenderB
+      invoiceId = "INV-2026-001"
+      discountRate = 0.025
+      commitHash = "b2c3d4e5f6a1"
+      revealed = True
+
+  -- Lender C: pre-revealed (4% discount)
+  bidC <- submitMulti [operator, lenderC] [] do
+    createCmd SealedBid with
+      operator
+      lender = lenderC
+      invoiceId = "INV-2026-001"
+      discountRate = 0.04
+      commitHash = "c3d4e5f6a1b2"
+      revealed = True
+
+  -- PRIVACY CHECK: Lender A should NOT be able to see Lender B's bid
+  -- Canton enforces this at the protocol level.
+  bidBVisible <- queryContractId lenderA bidB
+  assertMsg "Lender A should NOT see Lender B's bid" (isNone bidBVisible)
+
+  bidAVisible <- queryContractId lenderB bidA
+  assertMsg "Lender B should NOT see Lender A's bid" (isNone bidAVisible)
+
+  -- Step 6: Seller closes auction
+  closedAuctionCid <- submit seller do
+    exerciseCmd auctionCid CloseAuction with dummy = ()
+
+  -- Step 7: Operator evaluates bids and selects winner (lowest discount rate)
+  -- Winner: Lender B at 2.5%
+  resultCid <- submitMulti [operator, seller] [] do
+    createCmd AuctionResult with
+      operator
+      seller
+      winningLender = lenderB
+      invoiceId = "INV-2026-001"
+      winningRate = 0.025
+      invoiceAmount = 75000.0
+
+  -- Send rejections to losing lenders
+  submit operator do
+    createCmd BidRejection with
+      operator
+      lender = lenderA
+      invoiceId = "INV-2026-001"
+  submit operator do
+    createCmd BidRejection with
+      operator
+      lender = lenderC
+      invoiceId = "INV-2026-001"
+
+  -- PRIVACY CHECK: Losing lenders should not see the auction result
+  resultVisibleToA <- queryContractId lenderA resultCid
+  assertMsg "Lender A should NOT see auction result" (isNone resultVisibleToA)
+
+  resultVisibleToC <- queryContractId lenderC resultCid
+  assertMsg "Lender C should NOT see auction result" (isNone resultVisibleToC)
+
+  -- But winning lender SHOULD see it
+  resultVisibleToB <- queryContractId lenderB resultCid
+  assertMsg "Lender B SHOULD see auction result" (isSome resultVisibleToB)
+
+  -- Step 8: Winner settles — atomic settlement
+  settledCid <- submit lenderB do
+    exerciseCmd resultCid Settle with dummy = ()
+
+  -- Verify settlement: seller gets 75000 * (1 - 0.025) = 73125
+  settledOpt <- queryContractId lenderB settledCid
+  case settledOpt of
+    None -> assertFail "Settlement contract should be visible to lender B"
+    Some settled -> do
+      assertMsg "Financed amount should be 73125.0" (settled.financedAmount == 73125.0)
+      assertMsg "Status should be settled" (settled.status == "settled")
+
+  -- Seller should also see the settlement
+  settledSellerView <- queryContractId seller settledCid
+  assertMsg "Seller should see settlement" (isSome settledSellerView)
+
+  -- Losing lenders should NOT see settlement
+  settledLenderAView <- queryContractId lenderA settledCid
+  assertMsg "Lender A should NOT see settlement" (isNone settledLenderAView)
+
+  -- Step 9: Winner marks as collected
+  collectedCid <- submit lenderB do
+    exerciseCmd settledCid MarkCollected with dummy = ()
+
+  collectedOpt <- queryContractId lenderB collectedCid
+  case collectedOpt of
+    None -> assertFail "Collected contract should be visible to lender B"
+    Some collected ->
+      assertMsg "Status should be collected" (collected.status == "collected")
+
+  pure ()
+
+-- | Test commit-reveal flow
+commitRevealTest : Script ()
+commitRevealTest = script do
+  operator <- allocateParty "Operator"
+  lender   <- allocateParty "TestLender"
+
+  -- Phase 1: Commit — lender submits hash, rate is 0
+  bidCid <- submitMulti [operator, lender] [] do
+    createCmd SealedBid with
+      operator
+      lender
+      invoiceId = "INV-REVEAL-001"
+      discountRate = 0.0
+      commitHash = "sha256_of_rate_and_nonce"
+      revealed = False
+
+  -- Verify bid is not yet revealed
+  bidOpt <- queryContractId lender bidCid
+  case bidOpt of
+    None -> assertFail "Bid should be visible to lender"
+    Some bid -> do
+      assertMsg "Bid should not be revealed" (not bid.revealed)
+      assertMsg "Rate should be 0" (bid.discountRate == 0.0)
+
+  -- Phase 2: Reveal — lender reveals actual rate
+  revealedCid <- submit lender do
+    exerciseCmd bidCid Reveal with
+      actualRate = 0.035
+      nonce = "random_nonce_123"
+
+  -- Verify bid is now revealed with correct rate
+  revealedOpt <- queryContractId lender revealedCid
+  case revealedOpt of
+    None -> assertFail "Revealed bid should be visible to lender"
+    Some revealed -> do
+      assertMsg "Bid should be revealed" revealed.revealed
+      assertMsg "Rate should be 0.035" (revealed.discountRate == 0.035)
+
+  pure ()
+
+-- | Test dispute flow
+disputeFlowTest : Script ()
+disputeFlowTest = script do
+  operator <- allocateParty "Operator"
+  seller   <- allocateParty "TestSeller"
+  debtor   <- allocateParty "TestDebtor"
+
+  let invoiceData = InvoiceData with
+        invoiceId       = "INV-2026-002"
+        seller          = seller
+        debtorName      = debtor
+        amount          = 50000.0
+        currency        = "EUR"
+        sector          = "Technology"
+        paymentTermDays = 60
+        issueDate       = date 2026 Jun 1
+        dueDate         = date 2026 Aug 1
+        reliabilityScore = "B"
+
+  invoiceCid <- submitMulti [operator, seller] [] do
+    createCmd Invoice with
+      operator
+      seller
+      invoice = invoiceData
+      status = "pending"
+
+  -- Approve
+  verifiedCid <- submit operator do
+    exerciseCmd invoiceCid Approve
+
+  -- Dispute (debtor disputes directly — debtor is the controller)
+  disputedCid <- submit debtor do
+    exerciseCmd verifiedCid Dispute with reason = "Amount incorrect"
+
+  -- Resolve dispute (rejected — goes back to confirmed)
+  resolvedCid <- submit operator do
+    exerciseCmd disputedCid ResolveDispute with resolution = "rejected"
+
+  -- Verify it's confirmed now
+  resolvedOpt <- queryContractId operator resolvedCid
+  case resolvedOpt of
+    None -> assertFail "Resolved invoice should be visible"
+    Some resolved -> do
+      assertMsg "Status should be confirmed after rejected dispute" (resolved.status == "confirmed")
+
+  pure ()
