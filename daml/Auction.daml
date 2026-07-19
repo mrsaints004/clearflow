@@ -31,11 +31,13 @@ template SealedBid
 
     -- Ensure discount rate is reasonable (when revealed) or zero (when committed)
     ensure (revealed && discountRate > 0.0 && discountRate < 1.0) ||
-           (not revealed && commitHash /= "")
+           (not revealed && discountRate == 0.0 && commitHash /= "")
 
-    -- Lender reveals their bid after auction closes
-    -- In production: operator would verify hash(rate+nonce) == commitHash
-    -- For demo: we trust the reveal since hash verification needs off-chain computation
+    -- Lender reveals their bid after auction closes.
+    -- The operator verifies hash(rate+nonce) == commitHash off-chain via the backend
+    -- (SHA-256 is not available in Daml stdlib). The on-chain contract enforces rate
+    -- bounds and state transitions; the backend's crypto.ts verifyBidCommitment()
+    -- provides the cryptographic binding between commit and reveal phases.
     choice Reveal : ContractId SealedBid
       with
         actualRate : Decimal
@@ -44,6 +46,7 @@ template SealedBid
       do
         assertMsg "Bid already revealed" (not revealed)
         assertMsg "Rate must be between 0 and 1" (actualRate > 0.0 && actualRate < 1.0)
+        assertMsg "Nonce must not be empty" (nonce /= "")
         create this with
           discountRate = actualRate
           revealed = True

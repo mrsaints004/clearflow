@@ -68,9 +68,14 @@ export const apiClient = {
 
   // Bids
   submitBid: (lender: string, invoiceId: string, discountRate: number) =>
-    api("/bids", {
+    api<{ status: string; invoiceId: string; commitHash: string; nonce: string }>("/bids", {
       method: "POST",
       body: JSON.stringify({ lender, invoiceId, discountRate }),
+    }),
+  revealBid: (lender: string, invoiceId: string, discountRate: number, nonce: string) =>
+    api("/bids/" + invoiceId + "/reveal", {
+      method: "POST",
+      body: JSON.stringify({ lender, discountRate, nonce }),
     }),
 
   // Settlements

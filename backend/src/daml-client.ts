@@ -411,7 +411,9 @@ export async function initDamlClient(): Promise<boolean> {
     }
     savePartyRegistry(partyRegistry);
 
-    NAMESPACE = getOperatorPartyId().split("::")[1] || "";
+    const operatorId = getOperatorPartyId();
+    const nsParts = operatorId.split("::");
+    NAMESPACE = nsParts.length > 1 ? nsParts[1] : "";
 
     const pkgsEndpoint = API_VERSION === "v2" ? "/v2/packages" : "/v1/packages";
     const pkgToken = SEAPORT_DEVNET ? await refreshSeaportToken() : adminToken();
@@ -605,7 +607,7 @@ export const damlClient = {
         debtor,
         contractId: r.contractId,
         status: r.payload.status,
-        paymentTermDays: parseInt(r.payload.invoice.paymentTermDays),
+        paymentTermDays: parseInt(r.payload.invoice.paymentTermDays, 10) || 30,
         amount,
       };
       persistInvoice(invoiceCache, inv.invoiceId, inv);
@@ -632,7 +634,7 @@ export const damlClient = {
       invoiceId: r.payload.invoiceId,
       metadata: {
         ...r.payload.metadata,
-        paymentTermDays: parseInt(r.payload.metadata.paymentTermDays),
+        paymentTermDays: parseInt(r.payload.metadata.paymentTermDays, 10) || 30,
       },
       status: r.payload.status,
       contractId: r.contractId,
@@ -641,19 +643,47 @@ export const damlClient = {
 
   async submitBid(lenderName: string, invoiceId: string, discountRate: number): Promise<any> {
     const lenderParty = this.getPartyId(lenderName);
+    const nonce = crypto.randomBytes(16).toString("hex");
     const commitHash = crypto.createHash("sha256")
-      .update(`${discountRate.toFixed(10)}:${crypto.randomBytes(16).toString("hex")}`)
+      .update(`${discountRate.toFixed(10)}:${nonce}`)
       .digest("hex");
+
+    // COMMIT phase — create sealed bid with rate hidden (discountRate = 0)
     const payload = {
       operator: getOperatorPartyId(),
       lender: lenderParty,
       invoiceId,
-      discountRate: String(discountRate),
+      discountRate: "0",
       commitHash,
-      revealed: true,
+      revealed: false,
     };
     const result = await ledgerCreate(templateId("Auction", "SealedBid"), payload, [getOperatorPartyId(), lenderParty]);
-    return { status: "bid_accepted", invoiceId, contractId: result.contractId, commitHash };
+
+    return { status: "bid_committed", invoiceId, contractId: result.contractId, commitHash, nonce };
+  },
+
+  async revealBid(invoiceId: string, lenderName: string, discountRate: number, nonce: string): Promise<any> {
+    const lenderParty = this.getPartyId(lenderName);
+
+    // Find the sealed bid contract for this lender + invoice
+    const bids = await ledgerQuery([templateId("Auction", "SealedBid")], [lenderParty]);
+    const bidContract = bids.find(
+      (r: any) => r.payload.invoiceId === invoiceId && r.payload.lender === lenderParty && !r.payload.revealed
+    );
+    if (!bidContract) {
+      throw new Error("Sealed bid not found or already revealed");
+    }
+
+    // REVEAL phase — exercise the Reveal choice with actual rate + nonce
+    await ledgerExercise(
+      templateId("Auction", "SealedBid"),
+      bidContract.contractId,
+      "Reveal",
+      { actualRate: String(discountRate), nonce },
+      [lenderParty]
+    );
+
+    return { status: "bid_revealed", invoiceId, verified: true };
   },
 
   // Privacy-filtered: only returns bids where the lender matches the requesting party
@@ -796,9 +826,13 @@ export const damlClient = {
 
     const existingState = auctionStates.get(invoiceId);
     if (existingState?.status === "settled") {
-      const settlements = await this.getSettlements(lenderName);
-      const s = settlements.find((s: any) => s.invoiceId === invoiceId);
-      if (s) return s;
+      // Retry up to 3 times in case settlement hasn't propagated to cache yet
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const settlements = await this.getSettlements(lenderName);
+        const s = settlements.find((s: any) => s.invoiceId === invoiceId);
+        if (s) return s;
+        if (attempt < 2) await sleep(500);
+      }
     }
 
     const results = await ledgerQuery([templateId("Auction", "AuctionResult")], [lenderParty]);

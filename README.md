@@ -104,6 +104,7 @@ Invoice.Invoice        → signatory: operator, seller       (lenders never see 
 Invoice.AuctionInvite  → signatory: operator, seller
                          observer:  lenderObservers[]       (lenders see metadata only)
 Auction.SealedBid      → signatory: operator, lender       (no observers — fully private)
+                         ensure: unrevealed bids must have discountRate == 0
 Auction.AuctionResult  → signatory: operator, seller
                          observer:  winningLender only      (losers get BidRejection)
 Auction.BidRejection   → signatory: operator
@@ -115,6 +116,8 @@ Invoice.PaymentNotification → signatory: operator
 ```
 
 Canton's protocol guarantees that each participant node only receives contracts where its hosted party is a signatory or observer. Data physically does not exist on unauthorized nodes.
+
+**Commit-reveal architecture:** Lenders first commit a SHA-256 hash of `(rate + nonce)` on-chain with `discountRate = 0`. After the auction closes, they exercise `Reveal` with the actual rate. The backend verifies `SHA-256(rate + nonce) == commitHash` before accepting the reveal, providing cryptographic binding between phases. The Daml contract enforces that unrevealed bids cannot leak the rate (the `ensure` clause mandates `discountRate == 0` when `revealed == False`).
 
 ---
 
@@ -168,7 +171,7 @@ docker-compose up --build
 daml test
 ```
 
-Tests cover: full invoice lifecycle, **bid privacy verification** (Lender A cannot see Lender B's bid via `queryContractId`), commit-reveal flow, dispute resolution, and atomic settlement.
+Tests cover: full invoice lifecycle with **end-to-end commit-reveal** (commit with hash → reveal after close), **bid privacy verification** (Lender A cannot see Lender B's bid via `queryContractId`), dispute resolution, and atomic settlement.
 
 ### Backend Tests
 
@@ -191,9 +194,9 @@ cd backend && npx tsx src/__tests__/run-all.ts
 
 ### Cryptographic Integrity
 
-- **SHA-256 bid commitments** — commit-reveal prevents front-running and bid manipulation
+- **SHA-256 bid commitments** — commit-reveal prevents front-running and bid manipulation. Commitment binding is verified off-chain by the backend (`crypto.ts verifyBidCommitment()`); the Daml contract enforces rate bounds and state transitions on-chain.
 - **Hash-chained audit log** — tamper-evident trail with integrity verification endpoint
-- **Document hashing** — SHA-256 fingerprints for invoice authenticity
+- **Document hashing** — SHA-256 fingerprints covering all invoice fields for authenticity verification
 
 ### Multi-Party Workflow
 
@@ -250,9 +253,16 @@ clearflow/
 │   └── start.sh                 # Start Canton + JSON APIs
 ├── scripts/
 │   └── seed-demo.sh             # Seed demo data
+├── deploy/
+│   ├── setup-vps.sh             # Automated VPS setup
+│   ├── deploy.sh                # Build + deploy script
+│   ├── nginx.conf               # Nginx reverse proxy
+│   ├── clearflow.service        # systemd unit file
+│   └── .env.production.example  # Production env template
 ├── docker-compose.yml
 ├── Dockerfile                   # Multi-stage production build
-└── render.yaml                  # Render.com deployment config
+├── render.yaml                  # Render.com deployment config (alternative)
+└── documentation.md             # Full technical documentation
 ```
 
 ## Tech Stack
@@ -262,10 +272,45 @@ clearflow/
 | Smart Contracts | Daml (Canton Network SDK 2.10.4) |
 | Backend | Node.js / Express / TypeScript |
 | Frontend | React 19 / TypeScript |
-| Authentication | bcrypt + HMAC-SHA256 JWT |
+| Authentication | bcrypt + HMAC-SHA256 JWT + role-based authorization |
 | Cryptography | SHA-256 bid commitments, hash-chained audit log |
 | Privacy | Canton sub-transaction privacy (protocol-level) |
-| Deployment | Docker multi-stage build, Render.com |
+| Deployment | Docker multi-stage build, VPS (systemd + nginx) |
+
+## VPS Deployment
+
+```bash
+# 1. Copy to VPS
+rsync -avz --exclude node_modules --exclude .git . root@your-vps:/opt/clearflow/
+
+# 2. Run automated setup (installs Node.js, nginx, SSL, firewall, systemd)
+ssh root@your-vps
+cd /opt/clearflow
+./deploy/setup-vps.sh your-domain.com
+
+# 3. Configure secrets
+cp deploy/.env.production.example /opt/clearflow/.env.production
+nano /opt/clearflow/.env.production
+
+# 4. Build and start
+./deploy/deploy.sh
+```
+
+See [documentation.md](./documentation.md) for full deployment guide, API reference, and configuration details.
+
+## Full Documentation
+
+For comprehensive technical documentation including:
+- Complete API reference (40+ endpoints)
+- Privacy model deep dive
+- Daml contract design
+- Risk scoring engine details
+- AI agent system architecture
+- VPS and Docker deployment guides
+- Security considerations
+- Troubleshooting
+
+See **[documentation.md](./documentation.md)**
 
 ## License
 

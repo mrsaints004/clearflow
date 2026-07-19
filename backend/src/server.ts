@@ -16,9 +16,11 @@ import {
   authenticateParty,
   signAppToken,
   registerPartyPassword,
+  requireRole,
+  isAuthRequired,
 } from "./auth";
-import { clearAllPersistedData } from "./persistence";
-import { AuditChain } from "./crypto";
+import { clearAllPersistedData, loadAuditEntries, saveAuditEntries } from "./persistence";
+import { AuditChain, computeBidCommitment, generateNonce } from "./crypto";
 import {
   registerAgent,
   getAgent,
@@ -39,6 +41,7 @@ import {
   RegisterSchema,
   InvoiceCreateSchema,
   BidSubmitSchema,
+  BidRevealSchema,
   AuctionCreateSchema,
   DisputeSchema,
   ResolveDisputeSchema,
@@ -61,8 +64,13 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 let useLedger = false;
 
-// Application-layer audit chain — works in both modes
-const auditChain = new AuditChain();
+// Application-layer audit chain — persisted to disk, works in both modes
+const auditChain = new AuditChain({ onPersist: (entries) => saveAuditEntries(entries) });
+auditChain.load(loadAuditEntries());
+
+// Agent bid secrets: "party:invoiceId" -> { nonce, discountRate }
+// Stored server-side so agent bids can be auto-revealed when auction closes
+const agentBidSecrets = new Map<string, { nonce: string; discountRate: number }>();
 
 function validateConfig(): void {
   if (IS_PRODUCTION) {
@@ -146,6 +154,16 @@ function apiError(
   res.status(status).json(body);
 }
 
+// URL param validation: alphanumeric + hyphens/underscores, max 100 chars
+const SAFE_PARAM = /^[a-zA-Z0-9_\-]+$/;
+function validateParam(param: string, name: string, res: express.Response): boolean {
+  if (!param || param.length > 100 || !SAFE_PARAM.test(param)) {
+    res.status(400).json({ error: `Invalid ${name} parameter` });
+    return false;
+  }
+  return true;
+}
+
 app.use(authMiddleware);
 
 app.use((req, _res, next) => {
@@ -160,7 +178,7 @@ app.get("/api/health", (_req, res) => {
   res.json({
     status: "ok",
     mode: useLedger ? "canton-ledger" : "local-ledger",
-    authRequired: process.env.REQUIRE_AUTH === "true",
+    authRequired: isAuthRequired(),
     uptime: Math.floor(process.uptime()),
   });
 });
@@ -267,7 +285,7 @@ app.post("/api/parties/register", validate(RegisterSchema), async (req, res) => 
 
 // ─── Invoices ────────────────────────────────────────────────────────
 
-app.post("/api/invoices", validate(InvoiceCreateSchema), async (req, res) => {
+app.post("/api/invoices", requireRole("seller", "operator"), validate(InvoiceCreateSchema), async (req, res) => {
   try {
     const data: InvoiceData = req.body;
 
@@ -339,8 +357,9 @@ app.get("/api/invoices", async (req, res) => {
   }
 });
 
-app.post("/api/invoices/:invoiceId/approve", async (req, res) => {
+app.post("/api/invoices/:invoiceId/approve", requireRole("operator"), async (req, res) => {
   const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
   try {
     if (useLedger) {
       // Exercise Approve choice on Canton ledger
@@ -363,8 +382,9 @@ app.post("/api/invoices/:invoiceId/approve", async (req, res) => {
   }
 });
 
-app.post("/api/invoices/:invoiceId/confirm", async (req, res) => {
+app.post("/api/invoices/:invoiceId/confirm", requireRole("debtor", "operator"), async (req, res) => {
   const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
   const callerParty = req.authenticatedParty;
   try {
     if (useLedger) {
@@ -399,6 +419,7 @@ app.get("/api/payment-notifications", (req, res) => {
 
 app.get("/api/risk-score/:invoiceId", (req, res) => {
   const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
   if (useLedger) {
     // Risk scoring works from cached invoice data in both modes
     const cached = damlClient.getCachedInvoice(invoiceId);
@@ -418,8 +439,9 @@ app.get("/api/risk-score/:invoiceId", (req, res) => {
   }
 });
 
-app.post("/api/invoices/:invoiceId/dispute", validate(DisputeSchema), async (req, res) => {
+app.post("/api/invoices/:invoiceId/dispute", requireRole("debtor", "operator"), validate(DisputeSchema), async (req, res) => {
   const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
   const { reason } = req.body;
   const callerParty = req.authenticatedParty;
   if (!callerParty) {
@@ -446,8 +468,9 @@ app.post("/api/invoices/:invoiceId/dispute", validate(DisputeSchema), async (req
   }
 });
 
-app.post("/api/invoices/:invoiceId/resolve-dispute", validate(ResolveDisputeSchema), async (req, res) => {
+app.post("/api/invoices/:invoiceId/resolve-dispute", requireRole("operator"), validate(ResolveDisputeSchema), async (req, res) => {
   const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
   const { resolution } = req.body;
   try {
     if (useLedger) {
@@ -471,7 +494,7 @@ app.post("/api/invoices/:invoiceId/resolve-dispute", validate(ResolveDisputeSche
 
 // ─── Portfolio Auctions ──────────────────────────────────────────────
 
-app.post("/api/portfolio-auctions", validate(PortfolioCreateSchema), (req, res) => {
+app.post("/api/portfolio-auctions", requireRole("seller", "operator"), validate(PortfolioCreateSchema), (req, res) => {
   const { invoiceIds, seller } = req.body;
   // Portfolio auctions use application-layer logic in both modes
   const portfolio = ledger.createPortfolioAuction(invoiceIds, seller);
@@ -537,7 +560,7 @@ app.get("/api/portfolio-auctions/:portfolioId", (req, res) => {
   }
 });
 
-app.post("/api/portfolio-auctions/:portfolioId/bid", validate(PortfolioBidSchema), (req, res) => {
+app.post("/api/portfolio-auctions/:portfolioId/bid", requireRole("lender", "operator"), validate(PortfolioBidSchema), (req, res) => {
   const { portfolioId } = req.params;
   const { lender, discountRate } = req.body;
   const result = ledger.submitPortfolioBid({ lender, portfolioId, discountRate });
@@ -549,7 +572,7 @@ app.post("/api/portfolio-auctions/:portfolioId/bid", validate(PortfolioBidSchema
   res.status(201).json({ status: "bid_accepted", portfolioId, commitHash: result.commitHash });
 });
 
-app.post("/api/portfolio-auctions/:portfolioId/close", (req, res) => {
+app.post("/api/portfolio-auctions/:portfolioId/close", requireRole("seller", "operator"), (req, res) => {
   const { portfolioId } = req.params;
   const { seller } = req.body;
   const result = ledger.closePortfolioAuction(portfolioId, seller);
@@ -568,7 +591,7 @@ app.post("/api/portfolio-auctions/:portfolioId/close", (req, res) => {
   });
 });
 
-app.post("/api/portfolio-auctions/:portfolioId/settle", (req, res) => {
+app.post("/api/portfolio-auctions/:portfolioId/settle", requireRole("lender", "operator"), (req, res) => {
   const { portfolioId } = req.params;
   const { lender } = req.body;
   const result = ledger.settlePortfolio(portfolioId, lender);
@@ -604,7 +627,7 @@ app.get("/api/netting/:portfolioId", (req, res) => {
 
 // ─── Auctions ────────────────────────────────────────────────────────
 
-app.post("/api/auctions", validate(AuctionCreateSchema), async (req, res) => {
+app.post("/api/auctions", requireRole("seller", "operator"), validate(AuctionCreateSchema), async (req, res) => {
   try {
     const { invoiceId } = req.body;
     if (useLedger) {
@@ -653,8 +676,9 @@ app.get("/api/auctions", async (_req, res) => {
 });
 
 app.get("/api/auctions/:invoiceId", async (req, res) => {
+  const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
   try {
-    const { invoiceId } = req.params;
     const party = req.authenticatedParty || (req.query.party as string);
     const role = req.query.role as string | undefined;
 
@@ -717,7 +741,7 @@ app.get("/api/auctions/:invoiceId", async (req, res) => {
             amount: cachedInv.amount,
             currency: cachedInv.currency,
             sector: cachedInv.sector,
-            paymentTermDays: typeof cachedInv.paymentTermDays === 'string' ? parseInt(cachedInv.paymentTermDays) : cachedInv.paymentTermDays,
+            paymentTermDays: typeof cachedInv.paymentTermDays === 'string' ? (parseInt(cachedInv.paymentTermDays, 10) || 30) : cachedInv.paymentTermDays,
             reliabilityScore: cachedInv.reliabilityScore,
           } : undefined,
         });
@@ -787,15 +811,15 @@ app.get("/api/auctions/:invoiceId", async (req, res) => {
 
 // ─── Bids ────────────────────────────────────────────────────────────
 
-app.post("/api/bids", validate(BidSubmitSchema), async (req, res) => {
+app.post("/api/bids", requireRole("lender", "operator"), validate(BidSubmitSchema), async (req, res) => {
   try {
-    const bid: SealedBid = req.body;
-    const lender = req.authenticatedParty || bid.lender;
+    const { lender: bidLender, invoiceId, discountRate } = req.body;
+    const lender = req.authenticatedParty || bidLender;
 
     // Prevent debtor from bidding on their own debt
     if (useLedger) {
       const invoices = await damlClient.getInvoices();
-      const invoice = invoices.find((i: any) => i.invoiceId === bid.invoiceId);
+      const invoice = invoices.find((i: any) => i.invoiceId === invoiceId);
       if (invoice) {
         const debtorName = damlClient.getDisplayName(invoice.debtorName || invoice.debtor || "");
         if (debtorName === lender) {
@@ -804,28 +828,34 @@ app.post("/api/bids", validate(BidSubmitSchema), async (req, res) => {
         }
       }
     } else {
-      const invoice = ledger.getInvoice(bid.invoiceId);
+      const invoice = ledger.getInvoice(invoiceId);
       if (invoice && invoice.debtor === lender) {
         res.status(403).json({ error: "You cannot bid on an invoice where you are the debtor" });
         return;
       }
     }
 
+    // Generate commitment: nonce + hash, return nonce to lender for reveal phase
+    const nonce = generateNonce();
+    const commitHash = computeBidCommitment(discountRate, nonce);
+
     if (useLedger) {
-      const result = await damlClient.submitBid(lender, bid.invoiceId, bid.discountRate);
-      auditChain.append("SUBMIT_BID", lender, { invoiceId: bid.invoiceId });
-      console.log(`[AUDIT] Bid submitted on ${bid.invoiceId} by ${lender}`);
-      res.status(201).json(result);
+      const result = await damlClient.submitBid(lender, invoiceId, discountRate);
+      auditChain.append("SUBMIT_BID", lender, { invoiceId, commitHash });
+      console.log(`[AUDIT] Bid committed on ${invoiceId} by ${lender}`);
+      res.status(201).json({ ...result, nonce, commitHash });
     } else {
-      const sealedBid = ledger.submitBid({ ...bid, lender });
+      const sealedBid = ledger.submitBid({ lender, invoiceId, commitHash });
       if (!sealedBid) {
         res.status(400).json({ error: "Bid rejected — auction closed or duplicate bid" });
         return;
       }
       res.status(201).json({
-        status: "bid_accepted",
-        invoiceId: bid.invoiceId,
-        commitHash: sealedBid.commitHash,
+        status: "bid_committed",
+        invoiceId,
+        commitHash,
+        nonce,
+        message: "Store your nonce securely. You will need it to reveal your bid after the auction closes.",
       });
     }
   } catch (e: any) {
@@ -834,11 +864,60 @@ app.post("/api/bids", validate(BidSubmitSchema), async (req, res) => {
   }
 });
 
+// ─── Bid Reveal ─────────────────────────────────────────────────────
+
+app.post("/api/bids/:invoiceId/reveal", requireRole("lender", "operator"), validate(BidRevealSchema), async (req, res) => {
+  const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
+  try {
+    const { lender: revealLender, discountRate, nonce } = req.body;
+    const lender = req.authenticatedParty || revealLender;
+
+    if (useLedger) {
+      // Canton mode: reveal is handled by exercising the Reveal choice on SealedBid
+      const result = await damlClient.revealBid(invoiceId, lender, discountRate, nonce);
+      auditChain.append("REVEAL_BID", lender, { invoiceId, verified: true });
+      res.json({ status: "bid_revealed", invoiceId, verified: true, ...result });
+    } else {
+      const revealed = ledger.revealBid(invoiceId, lender, discountRate, nonce);
+      if (!revealed) {
+        res.status(400).json({
+          error: "Reveal failed — auction not closed, bid not found, already revealed, or commitment mismatch",
+        });
+        return;
+      }
+
+      // Check if all bids are now revealed — auto-finalize
+      const auction = ledger.getAuction(invoiceId);
+      const allRevealed = auction && auction.bids.every((b) => b.revealed);
+
+      res.json({
+        status: "bid_revealed",
+        invoiceId,
+        verified: revealed.verified,
+        allRevealed,
+        message: allRevealed
+          ? "All bids revealed. Auction can now be finalized."
+          : "Bid revealed. Waiting for other lenders to reveal.",
+      });
+
+      // Auto-finalize if all bids are revealed
+      if (allRevealed && auction) {
+        ledger.finalizeAuction(invoiceId);
+      }
+    }
+  } catch (e: any) {
+    console.error(`Bid reveal failed: ${e.message}`);
+    res.status(500).json({ error: IS_PRODUCTION ? "Bid reveal failed" : e.message });
+  }
+});
+
 // ─── Auction Close ───────────────────────────────────────────────────
 
-app.post("/api/auctions/:invoiceId/close", async (req, res) => {
+app.post("/api/auctions/:invoiceId/close", requireRole("seller", "operator"), async (req, res) => {
+  const { invoiceId } = req.params;
+  if (!validateParam(invoiceId, "invoiceId", res)) return;
   try {
-    const { invoiceId } = req.params;
     if (useLedger) {
       const result = await damlClient.closeAuction(invoiceId);
       const dn = damlClient.getDisplayName.bind(damlClient);
@@ -852,36 +931,74 @@ app.post("/api/auctions/:invoiceId/close", async (req, res) => {
         bids: result.bids.map((b: any) => ({ ...b, lender: dn(b.lender) })),
       });
     } else {
-      const { seller } = req.body;
+      const seller = req.authenticatedParty || req.body.seller;
+      // Validate seller owns the invoice behind this auction
+      const invoice = ledger.getInvoice(invoiceId);
+      if (invoice && seller && invoice.seller !== seller && req.authenticatedRole !== "operator") {
+        res.status(403).json({ error: "Only the invoice seller or operator can close this auction" });
+        return;
+      }
       const result = ledger.closeAuction(invoiceId, seller);
       if (!result) {
         res.status(400).json({ error: "Cannot close — auction not open or insufficient bids (min 2)" });
         return;
       }
 
-      // Record outcome for agent learning
-      try {
-        const auction = ledger.getAuction(invoiceId);
-        const invoice = ledger.getInvoice(invoiceId);
-        if (auction && invoice) {
-          recordAuctionOutcome(
-            invoiceId,
-            result.winningRate!,
-            auction.bids.map((b: any) => ({ lender: b.lender, discountRate: b.discountRate })),
-            {
-              sector: invoice.sector || "Manufacturing",
-              reliabilityScore: invoice.reliabilityScore || "B",
-              amountBucket: auction.metadata?.amountBucket || "50K-100K",
-            }
-          );
+      // Auto-reveal any agent bids that have stored secrets
+      for (const bid of result.bids) {
+        if (!bid.revealed) {
+          const key = `${bid.lender}:${invoiceId}`;
+          const secrets = agentBidSecrets.get(key);
+          if (secrets) {
+            ledger.revealBid(invoiceId, bid.lender, secrets.discountRate, secrets.nonce);
+            agentBidSecrets.delete(key);
+          }
         }
-      } catch (err) {
-        console.warn("Failed to record auction outcome:", err);
+      }
+
+      const unrevealedCount = result.bids.filter((b) => !b.revealed).length;
+
+      // If all bids were already revealed (e.g. agent bids), auto-finalize
+      if (unrevealedCount === 0) {
+        const finalized = ledger.finalizeAuction(invoiceId);
+        if (finalized) {
+          // Record outcome for agent learning
+          try {
+            const inv = ledger.getInvoice(invoiceId);
+            if (inv) {
+              recordAuctionOutcome(
+                invoiceId,
+                finalized.winningRate!,
+                finalized.bids.map((b: any) => ({ lender: b.lender, discountRate: b.discountRate })),
+                {
+                  sector: inv.sector || "Manufacturing",
+                  reliabilityScore: inv.reliabilityScore || "B",
+                  amountBucket: finalized.metadata?.amountBucket || "50K-100K",
+                }
+              );
+            }
+          } catch (err) {
+            console.warn("Failed to record auction outcome:", err);
+          }
+
+          res.json({
+            invoiceId: finalized.invoiceId,
+            status: finalized.status,
+            winningLender: finalized.winningLender,
+            winningRate: finalized.winningRate,
+          });
+          return;
+        }
       }
 
       res.json({
         invoiceId: result.invoiceId,
         status: result.status,
+        bidCount: result.bids.length,
+        unrevealedCount,
+        message: unrevealedCount > 0
+          ? `Auction closed. Waiting for ${unrevealedCount} lender(s) to reveal their bids.`
+          : "Auction closed and finalized.",
         winningLender: result.winningLender,
         winningRate: result.winningRate,
       });
@@ -894,7 +1011,7 @@ app.post("/api/auctions/:invoiceId/close", async (req, res) => {
 
 // ─── Settlements ─────────────────────────────────────────────────────
 
-app.post("/api/settlements", validate(SettleSchema), async (req, res) => {
+app.post("/api/settlements", requireRole("lender", "operator"), validate(SettleSchema), async (req, res) => {
   try {
     const { invoiceId, lender } = req.body;
     const settlingLender = req.authenticatedParty || lender;
@@ -1013,6 +1130,7 @@ app.get("/api/audit-log/verify", (_req, res) => {
 
 app.get("/api/privacy-scope/:party", async (req, res) => {
   const { party } = req.params;
+  if (!validateParam(party, "party", res)) return;
 
   if (useLedger) {
     // In Canton mode, build privacy scope from ledger queries
@@ -1252,13 +1370,13 @@ app.get("/api/agents/:name", (req, res) => {
   res.json(agent);
 });
 
-app.post("/api/agents", validate(AgentCreateSchema), (req, res) => {
+app.post("/api/agents", requireRole("lender", "operator"), validate(AgentCreateSchema), (req, res) => {
   const config: AgentConfig = req.body;
   const agent = registerAgent(config);
   res.status(201).json(agent);
 });
 
-app.post("/api/agents/:name/configure", validate(AgentConfigureSchema), (req, res) => {
+app.post("/api/agents/:name/configure", requireRole("lender", "operator"), validate(AgentConfigureSchema), (req, res) => {
   const agent = getAgent(req.params.name);
   if (!agent) {
     res.status(404).json({ error: "Agent not found" });
@@ -1275,7 +1393,7 @@ app.post("/api/agents/:name/configure", validate(AgentConfigureSchema), (req, re
   res.json(agent);
 });
 
-app.post("/api/agents/:name/analyze", async (req, res) => {
+app.post("/api/agents/:name/analyze", requireRole("lender", "operator"), async (req, res) => {
   const agent = getAgent(req.params.name);
   if (!agent) {
     res.status(404).json({ error: "Agent not found" });
@@ -1306,9 +1424,12 @@ app.post("/api/agents/:name/analyze", async (req, res) => {
         return;
       }
       let analysis = analyzeAuction(auction.metadata, agent, auction.bidCount || 0);
-      // Attach LLM explanation if available
+      // Attach LLM explanation if available (5s timeout)
       try {
-        analysis = await getAnalysisWithLLM(analysis);
+        analysis = await Promise.race([
+          getAnalysisWithLLM(analysis),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM timeout")), 5000)),
+        ]);
       } catch { /* LLM optional */ }
       res.json(analysis);
     } else {
@@ -1321,10 +1442,13 @@ app.post("/api/agents/:name/analyze", async (req, res) => {
         })),
         agent
       );
-      // Attach LLM explanation to each analysis
+      // Attach LLM explanation to each analysis (5s timeout per analysis)
       try {
         for (let i = 0; i < report.analyses.length; i++) {
-          report.analyses[i] = await getAnalysisWithLLM(report.analyses[i]);
+          report.analyses[i] = await Promise.race([
+            getAnalysisWithLLM(report.analyses[i]),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM timeout")), 5000)),
+          ]);
         }
       } catch { /* LLM optional */ }
       res.json(report);
@@ -1335,7 +1459,7 @@ app.post("/api/agents/:name/analyze", async (req, res) => {
   }
 });
 
-app.post("/api/agents/:name/auto-bid", async (req, res) => {
+app.post("/api/agents/:name/auto-bid", requireRole("lender", "operator"), async (req, res) => {
   const agent = getAgent(req.params.name);
   if (!agent) {
     res.status(404).json({ error: "Agent not found" });
@@ -1401,29 +1525,35 @@ app.post("/api/agents/:name/auto-bid", async (req, res) => {
       return;
     }
 
-    // Submit the bid
+    // Submit the bid with commit-reveal
+    const nonce = generateNonce();
+    const commitHash = computeBidCommitment(analysis.suggestedRate, nonce);
+
     if (useLedger) {
       const result = await damlClient.submitBid(agent.party, invoiceId, analysis.suggestedRate);
       auditChain.append("AGENT_BID", agent.party, {
-        invoiceId, agent: agent.name, rate: analysis.suggestedRate,
+        invoiceId, agent: agent.name, commitHash,
       });
-      res.json({ action: "bid_submitted", ...result, analysis });
+      // Store nonce for auto-reveal (agent bids auto-reveal when auction closes)
+      agentBidSecrets.set(`${agent.party}:${invoiceId}`, { nonce, discountRate: analysis.suggestedRate });
+      res.json({ action: "bid_committed", ...result, analysis });
     } else {
       const sealedBid = ledger.submitBid({
         lender: agent.party,
         invoiceId,
-        discountRate: analysis.suggestedRate,
+        commitHash,
       });
       if (!sealedBid) {
         res.status(400).json({ error: "Bid rejected — auction closed or duplicate bid" });
         return;
       }
+      // Store nonce for auto-reveal when auction closes
+      agentBidSecrets.set(`${agent.party}:${invoiceId}`, { nonce, discountRate: analysis.suggestedRate });
       res.json({
-        action: "bid_submitted",
-        status: "bid_accepted",
+        action: "bid_committed",
+        status: "bid_committed",
         invoiceId,
-        discountRate: analysis.suggestedRate,
-        commitHash: sealedBid.commitHash,
+        commitHash,
         analysis,
       });
     }
@@ -1486,13 +1616,6 @@ app.post("/api/reset", (_req, res) => {
   }
 });
 
-// ─── Error Handler ───────────────────────────────────────────────────
-
-app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error(`[ERROR] Unhandled: ${err.message}`);
-  res.status(500).json({ error: IS_PRODUCTION ? "Internal server error" : err.message });
-});
-
 // ─── Static Files (Production) ───────────────────────────────────────
 
 if (IS_PRODUCTION) {
@@ -1502,6 +1625,13 @@ if (IS_PRODUCTION) {
     res.sendFile(path.join(publicDir, "index.html"));
   });
 }
+
+// ─── Error Handler ───────────────────────────────────────────────────
+
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error(`[ERROR] Unhandled: ${err.message}`);
+  res.status(500).json({ error: IS_PRODUCTION ? "Internal server error" : err.message });
+});
 
 // ─── Start ───────────────────────────────────────────────────────────
 
@@ -1516,7 +1646,7 @@ const server = app.listen(PORT, async () => {
   console.log(`ClearFlow API running on port ${PORT}`);
   console.log(`Mode: ${useLedger ? "Canton Ledger" : "Local Ledger (standalone)"}`);
   console.log(`Environment: ${IS_PRODUCTION ? "PRODUCTION" : "development"}`);
-  console.log(`Auth: ${process.env.REQUIRE_AUTH === "true" ? "REQUIRED" : "optional"}`);
+  console.log(`Auth: ${isAuthRequired() ? "REQUIRED" : "optional"}`);
 });
 
 function shutdown(signal: string) {

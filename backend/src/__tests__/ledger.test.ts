@@ -1,4 +1,5 @@
 import { ledger } from "../ledger";
+import { computeBidCommitment, generateNonce } from "../crypto";
 
 let passed = 0;
 let failed = 0;
@@ -30,6 +31,20 @@ const TEST_LENDER_B = "TestLenderB";
 const TEST_LENDER_C = "TestLenderC";
 const TEST_DEBTOR = "TestDebtor";
 const TEST_DEBTOR_2 = "TestDebtor2";
+
+// Store nonces for reveal phase
+const bidSecrets: Record<string, { nonce: string; discountRate: number }> = {};
+
+function commitBid(lender: string, invoiceId: string, discountRate: number): ReturnType<typeof ledger.submitBid> {
+  const nonce = generateNonce();
+  const commitHash = computeBidCommitment(discountRate, nonce);
+  const result = ledger.submitBid({ lender, invoiceId, commitHash });
+  // Only store secrets if the bid was accepted
+  if (result !== null) {
+    bidSecrets[`${lender}:${invoiceId}`] = { nonce, discountRate };
+  }
+  return result;
+}
 
 // Reset before each suite
 ledger.reset();
@@ -104,32 +119,23 @@ test("Auction creation for non-existent invoice returns null", () => {
   assert(auction === null, "Returns null for missing invoice");
 });
 
-// ── Bid Tests ──
+// ── Bid Tests (commit-reveal) ──
 
-test("Submit bid to open auction", () => {
-  const result = ledger.submitBid({
-    lender: TEST_LENDER_A,
-    invoiceId: "TEST-001",
-    discountRate: 0.03,
-  });
+test("Submit bid (commit) to open auction", () => {
+  const result = commitBid(TEST_LENDER_A, "TEST-001", 0.03);
   assert(result !== null, "Bid accepted");
+  assert(result!.discountRate === 0, "Rate is hidden (0) before reveal");
+  assert(result!.revealed === false, "Not yet revealed");
+  assert(result!.commitHash!.length === 64, "Commit hash is 64 hex chars");
 });
 
 test("Reject duplicate bid from same lender", () => {
-  const result = ledger.submitBid({
-    lender: TEST_LENDER_A,
-    invoiceId: "TEST-001",
-    discountRate: 0.02,
-  });
+  const result = commitBid(TEST_LENDER_A, "TEST-001", 0.02);
   assert(result === null, "Duplicate bid rejected");
 });
 
 test("Submit second bid from different lender", () => {
-  const result = ledger.submitBid({
-    lender: TEST_LENDER_B,
-    invoiceId: "TEST-001",
-    discountRate: 0.025,
-  });
+  const result = commitBid(TEST_LENDER_B, "TEST-001", 0.025);
   assert(result !== null, "Second bid accepted");
 });
 
@@ -144,18 +150,16 @@ test("Privacy: lender only sees own bids", () => {
   assert(betaBids[0].lender === TEST_LENDER_B, `${TEST_LENDER_B} sees own bid`);
 });
 
-test("Privacy: lender cannot see other's discount rate", () => {
+test("Privacy: rates are hidden before reveal", () => {
   const alphaBids = ledger.getBidsForParty("TEST-001", TEST_LENDER_A);
   const betaBids = ledger.getBidsForParty("TEST-001", TEST_LENDER_B);
-  assert(alphaBids[0].discountRate === 0.03, `${TEST_LENDER_A} sees own rate`);
-  assert(betaBids[0].discountRate === 0.025, `${TEST_LENDER_B} sees own rate`);
-  // Neither can see the other's rate — getBidsForParty enforces this
+  assert(alphaBids[0].discountRate === 0, `${TEST_LENDER_A} rate hidden before reveal`);
+  assert(betaBids[0].discountRate === 0, `${TEST_LENDER_B} rate hidden before reveal`);
 });
 
 // ── Close Auction Tests ──
 
 test("Cannot close auction with fewer than 2 bids", () => {
-  // Create a fresh auction
   ledger.createInvoice({
     invoiceId: "TEST-002",
     seller: TEST_SELLER,
@@ -171,17 +175,16 @@ test("Cannot close auction with fewer than 2 bids", () => {
   ledger.approveInvoice("TEST-002");
   ledger.confirmInvoice("TEST-002");
   ledger.createAuction("TEST-002");
-  ledger.submitBid({ lender: TEST_LENDER_A, invoiceId: "TEST-002", discountRate: 0.04 });
+  commitBid(TEST_LENDER_A, "TEST-002", 0.04);
   const result = ledger.closeAuction("TEST-002", TEST_SELLER);
   assert(result === null, "Cannot close with only 1 bid");
 });
 
-test("Close auction selects lowest rate as winner", () => {
+test("Close auction sets status to closed (no winner yet)", () => {
   const result = ledger.closeAuction("TEST-001", TEST_SELLER);
   assert(result !== null, "Auction closed successfully");
-  assert(result!.winningLender === TEST_LENDER_B, `${TEST_LENDER_B} wins (2.5% < 3%)`);
-  assert(result!.winningRate === 0.025, "Winning rate is 2.5%");
   assert(result!.status === "closed", "Status is closed");
+  assert(result!.winningLender === undefined, "No winner yet — bids not revealed");
 });
 
 test("Cannot close already closed auction", () => {
@@ -190,12 +193,66 @@ test("Cannot close already closed auction", () => {
 });
 
 test("Cannot submit bid to closed auction", () => {
-  const result = ledger.submitBid({
-    lender: TEST_LENDER_C,
-    invoiceId: "TEST-001",
-    discountRate: 0.015,
-  });
+  const result = commitBid(TEST_LENDER_C, "TEST-001", 0.015);
   assert(result === null, "Bid rejected on closed auction");
+});
+
+// ── Reveal Tests ──
+
+test("Cannot reveal before auction is closed", () => {
+  // TEST-002 is still open (only 1 bid, close failed)
+  const secret = bidSecrets[`${TEST_LENDER_A}:TEST-002`];
+  const result = ledger.revealBid("TEST-002", TEST_LENDER_A, secret.discountRate, secret.nonce);
+  assert(result === null, "Cannot reveal on open auction");
+});
+
+test("Reveal bid with valid commitment", () => {
+  const secretA = bidSecrets[`${TEST_LENDER_A}:TEST-001`];
+  const result = ledger.revealBid("TEST-001", TEST_LENDER_A, secretA.discountRate, secretA.nonce);
+  assert(result !== null, "Reveal accepted");
+  assert(result!.discountRate === 0.03, "Rate revealed correctly");
+  assert(result!.verified === true, "Commitment verified");
+  assert(result!.revealed === true, "Marked as revealed");
+});
+
+test("Reveal bid with wrong nonce fails", () => {
+  // Lender B tries to reveal with wrong nonce
+  const result = ledger.revealBid("TEST-001", TEST_LENDER_B, 0.025, "0000000000000000");
+  assert(result === null, "Wrong nonce rejected");
+});
+
+test("Reveal bid with tampered rate fails", () => {
+  const secretB = bidSecrets[`${TEST_LENDER_B}:TEST-001`];
+  const result = ledger.revealBid("TEST-001", TEST_LENDER_B, 0.099, secretB.nonce);
+  assert(result === null, "Tampered rate rejected");
+});
+
+test("Cannot finalize with unrevealed bids", () => {
+  const result = ledger.finalizeAuction("TEST-001");
+  assert(result === null, "Cannot finalize — Lender B hasn't revealed");
+});
+
+test("Reveal second bid", () => {
+  const secretB = bidSecrets[`${TEST_LENDER_B}:TEST-001`];
+  const result = ledger.revealBid("TEST-001", TEST_LENDER_B, secretB.discountRate, secretB.nonce);
+  assert(result !== null, "Second reveal accepted");
+  assert(result!.discountRate === 0.025, "Rate revealed correctly");
+});
+
+test("Cannot double-reveal", () => {
+  const secretA = bidSecrets[`${TEST_LENDER_A}:TEST-001`];
+  const result = ledger.revealBid("TEST-001", TEST_LENDER_A, secretA.discountRate, secretA.nonce);
+  assert(result === null, "Double reveal rejected");
+});
+
+// ── Finalize Tests ──
+
+test("Finalize auction selects lowest rate as winner", () => {
+  const result = ledger.finalizeAuction("TEST-001");
+  assert(result !== null, "Auction finalized");
+  assert(result!.winningLender === TEST_LENDER_B, `${TEST_LENDER_B} wins (2.5% < 3%)`);
+  assert(result!.winningRate === 0.025, "Winning rate is 2.5%");
+  assert(result!.status === "closed", "Status remains closed");
 });
 
 // ── Settlement Tests ──
@@ -210,7 +267,6 @@ test("Winner can settle", () => {
 });
 
 test("Non-winner cannot settle", () => {
-  // Reset and redo to test non-winner
   const settlement = ledger.settle("TEST-001", TEST_LENDER_A);
   assert(settlement === null, `${TEST_LENDER_A} cannot settle (not winner)`);
 });

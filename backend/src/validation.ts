@@ -70,7 +70,28 @@ export const BidSubmitSchema = z.object({
   discountRate: z
     .number({ error: "Discount rate must be a number" })
     .gt(0, "Discount rate must be greater than 0")
-    .lt(1, "Discount rate must be less than 1"),
+    .lt(1, "Discount rate must be less than 1")
+    .refine(
+      (val) => Number(val.toFixed(4)) === val,
+      "Discount rate must have at most 4 decimal places"
+    ),
+});
+
+export const BidRevealSchema = z.object({
+  lender: z.string().min(1, "Lender is required"),
+  discountRate: z
+    .number({ error: "Discount rate must be a number" })
+    .gt(0, "Discount rate must be greater than 0")
+    .lt(1, "Discount rate must be less than 1")
+    .refine(
+      (val) => Number(val.toFixed(4)) === val,
+      "Discount rate must have at most 4 decimal places"
+    ),
+  nonce: z
+    .string()
+    .min(1, "Nonce is required")
+    .max(64, "Nonce must be 64 characters or fewer")
+    .regex(/^[a-f0-9]+$/i, "Nonce must be a hex string"),
 });
 
 export const AuctionCreateSchema = z.object({
@@ -119,7 +140,8 @@ export const AgentConfigureSchema = z.object({
 export const PortfolioCreateSchema = z.object({
   invoiceIds: z
     .array(z.string().min(1))
-    .min(2, "Need at least 2 invoice IDs"),
+    .min(2, "Need at least 2 invoice IDs")
+    .max(50, "Portfolio can contain at most 50 invoices"),
   seller: z.string().min(1, "Seller is required"),
 });
 

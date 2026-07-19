@@ -36,12 +36,19 @@ async function writeJsonAtomic(name: string, data: any): Promise<void> {
     ensureDir();
     const target = filePath(name);
     const tmpFile = path.join(
-      os.tmpdir(),
-      `clearflow-${name}-${crypto.randomBytes(4).toString("hex")}.tmp`
+      DATA_DIR,
+      `.clearflow-${name}-${crypto.randomBytes(4).toString("hex")}.tmp`
     );
-    const content = JSON.stringify(data, null, 2);
 
-    fs.writeFileSync(tmpFile, content, "utf-8");
+    let content: string;
+    try {
+      content = JSON.stringify(data, null, 2);
+    } catch (e) {
+      console.error(`[Persistence] Failed to serialize "${name}":`, e);
+      return; // Don't overwrite valid data with corrupt serialization
+    }
+
+    fs.writeFileSync(tmpFile, content, { encoding: "utf-8", mode: 0o600 });
     fs.renameSync(tmpFile, target);
   })();
 
@@ -58,10 +65,19 @@ function writeJsonSync(name: string, data: any): void {
   ensureDir();
   const target = filePath(name);
   const tmpFile = path.join(
-    os.tmpdir(),
-    `clearflow-${name}-${crypto.randomBytes(4).toString("hex")}.tmp`
+    DATA_DIR,
+    `.clearflow-${name}-${crypto.randomBytes(4).toString("hex")}.tmp`
   );
-  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), "utf-8");
+
+  let content: string;
+  try {
+    content = JSON.stringify(data, null, 2);
+  } catch (e) {
+    console.error(`[Persistence] Failed to serialize "${name}":`, e);
+    return;
+  }
+
+  fs.writeFileSync(tmpFile, content, { encoding: "utf-8", mode: 0o600 });
   fs.renameSync(tmpFile, target);
 }
 
@@ -147,9 +163,32 @@ export function saveAgentActions(actions: any[]): void {
   writeJsonAtomic("agent-actions", actions);
 }
 
+// ─── Audit Chain ────────────────────────────────────────────────────
+
+export interface PersistedAuditEntry {
+  sequenceNumber: number;
+  timestamp: string;
+  action: string;
+  party: string;
+  data: Record<string, any>;
+  prevHash: string;
+  hash: string;
+}
+
+export function loadAuditEntries(): PersistedAuditEntry[] {
+  return readJson<PersistedAuditEntry[]>("audit-chain", []);
+}
+
+export function saveAuditEntries(entries: PersistedAuditEntry[]): void {
+  writeJsonAtomic("audit-chain", entries);
+}
+
+// ─── Clear All ──────────────────────────────────────────────────────
+
 export function clearAllPersistedData(): void {
   writeJsonSync("invoices", {});
   writeJsonSync("auctions", {});
   writeJsonSync("agent-outcomes", []);
   writeJsonSync("agent-actions", []);
+  writeJsonSync("audit-chain", []);
 }

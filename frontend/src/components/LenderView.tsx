@@ -26,6 +26,8 @@ export default function LenderView({ partyName, label, color, onTransaction }: P
   const [portfolios, setPortfolios] = useState<any[]>([]);
   const [portfolioDetails, setPortfolioDetails] = useState<Map<string, any>>(new Map());
   const [portfolioBidRates, setPortfolioBidRates] = useState<Map<string, string>>(new Map());
+  // Store nonces for the reveal phase: invoiceId -> { nonce, discountRate }
+  const [bidSecrets, setBidSecrets] = useState<Map<string, { nonce: string; discountRate: number }>>(new Map());
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [confirmAction, setConfirmAction] = useState<{ id: string; type: string } | null>(null);
@@ -99,15 +101,19 @@ export default function LenderView({ partyName, label, color, onTransaction }: P
     }
     setLoading(true);
     try {
-      await apiClient.submitBid(partyName, invoiceId, rate);
-      setMessage(`Bid submitted: ${rateStr}% discount on ${invoiceId}`);
+      const result = await apiClient.submitBid(partyName, invoiceId, rate);
+      // Store nonce for the reveal phase
+      if (result.nonce) {
+        setBidSecrets((prev) => new Map(prev).set(invoiceId, { nonce: result.nonce, discountRate: rate }));
+      }
+      setMessage(`Bid committed: ${rateStr}% on ${invoiceId}. Your bid is sealed until the auction closes.`);
       onTransaction?.({
         id: `bid-${Date.now()}`,
         timestamp: new Date().toLocaleTimeString(),
-        action: "Submit Sealed Bid",
+        action: "Commit Sealed Bid",
         template: "Auction.SealedBid",
         actingParty: partyName,
-        details: `${rateStr}% on ${invoiceId}`,
+        details: `${rateStr}% on ${invoiceId} (sealed)`,
       });
       setBidRates((prev) => {
         const next = new Map(prev);
@@ -122,6 +128,38 @@ export default function LenderView({ partyName, label, color, onTransaction }: P
       refresh();
     } catch (e: any) {
       addToast("error", e.message || "Operation failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const revealBid = async (invoiceId: string) => {
+    const secrets = bidSecrets.get(invoiceId);
+    if (!secrets) {
+      addToast("error", "No bid secrets found — you may need to re-submit your bid");
+      return;
+    }
+    setLoading(true);
+    try {
+      await apiClient.revealBid(partyName, invoiceId, secrets.discountRate, secrets.nonce);
+      setMessage(`Bid revealed: ${(secrets.discountRate * 100).toFixed(1)}% on ${invoiceId}`);
+      onTransaction?.({
+        id: `reveal-${Date.now()}`,
+        timestamp: new Date().toLocaleTimeString(),
+        action: "Reveal Bid",
+        template: "Auction.SealedBid.Reveal",
+        actingParty: partyName,
+        details: `${(secrets.discountRate * 100).toFixed(1)}% on ${invoiceId}`,
+      });
+      // Clear stored secrets after successful reveal
+      setBidSecrets((prev) => {
+        const next = new Map(prev);
+        next.delete(invoiceId);
+        return next;
+      });
+      refresh();
+    } catch (e: any) {
+      addToast("error", e.message || "Reveal failed");
     } finally {
       setLoading(false);
     }
@@ -317,22 +355,59 @@ export default function LenderView({ partyName, label, color, onTransaction }: P
 
               {hasBid && (
                 <div className="my-bid">
-                  Your bid:{" "}
-                  <strong>
-                    {((detail!.myBid!.discountRate) * 100).toFixed(1)}% discount
-                  </strong>
-                  {isOpen && <span className="bid-status"> (sealed)</span>}
-                  {(detail!.myBid as any)?.commitHash && (
-                    <div className="crypto-hash" style={{ marginTop: 6 }}>
-                      <span className="hash-label">Commitment:</span>
-                      <code className="hash-value">
-                        {(detail!.myBid as any).commitHash.substring(0, 20)}...
-                      </code>
-                      {(detail!.myBid as any).verified && (
-                        <span className="commit-badge verified">VERIFIED</span>
-                      )}
-                    </div>
-                  )}
+                  {(() => {
+                    const myBid = detail!.myBid!;
+                    const isRevealed = (myBid as any).revealed || (myBid as any).verified;
+                    const hasSecrets = bidSecrets.has(a.invoiceId);
+                    const isClosed = status === "closed";
+                    const needsReveal = isClosed && !isRevealed && hasSecrets;
+
+                    return (
+                      <>
+                        Your bid:{" "}
+                        <strong>
+                          {isRevealed
+                            ? `${(myBid.discountRate * 100).toFixed(1)}% discount`
+                            : hasSecrets
+                              ? `${(bidSecrets.get(a.invoiceId)!.discountRate * 100).toFixed(1)}% discount`
+                              : "Sealed"
+                          }
+                        </strong>
+                        {isOpen && <span className="bid-status"> (sealed - hidden until auction closes)</span>}
+                        {needsReveal && <span className="bid-status"> (awaiting your reveal)</span>}
+                        {isRevealed && <span className="bid-status"> (revealed)</span>}
+
+                        {(myBid as any)?.commitHash && (
+                          <div className="crypto-hash" style={{ marginTop: 6 }}>
+                            <span className="hash-label">Commitment:</span>
+                            <code className="hash-value">
+                              {(myBid as any).commitHash.substring(0, 20)}...
+                            </code>
+                            {(myBid as any).verified && (
+                              <span className="commit-badge verified">VERIFIED</span>
+                            )}
+                          </div>
+                        )}
+
+                        {needsReveal && (
+                          <button
+                            onClick={() => revealBid(a.invoiceId)}
+                            className="btn btn-primary"
+                            disabled={loading}
+                            style={{ marginTop: 8 }}
+                          >
+                            {loading ? "Revealing..." : "Reveal Bid"}
+                          </button>
+                        )}
+
+                        {isClosed && !isRevealed && !hasSecrets && (
+                          <div style={{ marginTop: 6, color: "#e74c3c", fontSize: "0.85em" }}>
+                            Bid secrets not found in this session. If you submitted from a different session, you will need to re-enter your nonce to reveal.
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               )}
 

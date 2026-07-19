@@ -2,8 +2,13 @@ node_modules/
 dist/
 build/
 .daml/
+.daml-cache/
 .env
+.env.*
+!.env.example
+!.env.production.example
 *.log
+*.log.*.gz
 
 # Daml generated
 target/
@@ -11,15 +16,48 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+.AppleDouble
+.LSOverride
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-workspace
+*.sublime-project
 
 # Build artifacts
 frontend/build/
+backend/dist/
 
 # Data files (regenerated on startup)
 backend/data/*.json
+
+# Production secrets
+.env.production
+deploy/.env.production
+
+# Log directory
+log/
+
+# Runtime
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage
+coverage/
+*.lcov
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Package manager
+package-lock.json
+yarn.lock
+
+# Claude
+.claude/

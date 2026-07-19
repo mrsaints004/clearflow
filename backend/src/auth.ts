@@ -5,6 +5,14 @@ import { loadPasswordHashes, savePasswordHashes } from "./persistence";
 
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
+// In production, auth is required unless explicitly disabled.
+// In development, auth is optional unless explicitly enabled.
+export function isAuthRequired(): boolean {
+  if (isAuthRequired()) return true;
+  if (process.env.REQUIRE_AUTH === "false") return false;
+  return IS_PRODUCTION; // default: required in production, optional in dev
+}
+
 const APP_SECRET = process.env.APP_SECRET || (
   IS_PRODUCTION ? "" : "clearflow-dev-secret-do-not-use-in-production"
 );
@@ -15,9 +23,15 @@ const passwordHashes: Map<string, string> = new Map();
 
 // Load persisted hashes from disk
 function loadPersistedPasswords(): void {
-  const stored = loadPasswordHashes();
-  for (const [party, hash] of Object.entries(stored)) {
-    passwordHashes.set(party, hash);
+  try {
+    const stored = loadPasswordHashes();
+    for (const [party, hash] of Object.entries(stored)) {
+      if (typeof hash === "string" && hash.length > 0) {
+        passwordHashes.set(party, hash);
+      }
+    }
+  } catch (e) {
+    console.error("Failed to load persisted password hashes — starting with empty store:", e);
   }
 }
 
@@ -122,7 +136,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    if (process.env.REQUIRE_AUTH === "true") {
+    if (isAuthRequired()) {
       res.status(401).json({ error: "Authentication required. Call POST /api/auth/login first." });
       return;
     }
@@ -155,7 +169,7 @@ export function authorizeParty(getParty: (req: Request) => string | undefined) {
   return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.authenticatedParty) {
       // If auth is not enforced, allow through
-      if (process.env.REQUIRE_AUTH !== "true") {
+      if (!isAuthRequired()) {
         next();
         return;
       }
@@ -169,6 +183,25 @@ export function authorizeParty(getParty: (req: Request) => string | undefined) {
       return;
     }
 
+    next();
+  };
+}
+
+export function requireRole(...roles: string[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    // If auth is not enforced, allow through (dev mode)
+    if (!isAuthRequired()) {
+      next();
+      return;
+    }
+    if (!req.authenticatedParty || !req.authenticatedRole) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    if (!roles.includes(req.authenticatedRole)) {
+      res.status(403).json({ error: `Forbidden: requires role ${roles.join(" or ")}` });
+      return;
+    }
     next();
   };
 }

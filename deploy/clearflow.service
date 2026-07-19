@@ -1,0 +1,35 @@
+[Unit]
+Description=ClearFlow API Server
+Documentation=https://github.com/your-org/clearflow
+After=network.target
+
+[Service]
+Type=simple
+User=clearflow
+Group=clearflow
+WorkingDirectory=/opt/clearflow/backend
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clearflow
+
+# Environment
+Environment=NODE_ENV=production
+Environment=PORT=3002
+EnvironmentFile=/opt/clearflow/.env.production
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/clearflow/backend/data
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

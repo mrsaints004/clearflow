@@ -10,8 +10,6 @@
 #   - If Canton is reachable: uses Canton ledger with protocol-level privacy
 #   - If not: falls back to standalone ledger with application-level privacy
 
-version: "3.8"
-
 services:
   # ClearFlow application (backend + frontend)
   app:

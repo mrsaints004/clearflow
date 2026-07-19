@@ -64,36 +64,39 @@ fullFlowTest = script do
   auctionVisibleToA <- queryContractId lenderA auctionCid
   assertMsg "Lender A should see auction invite" (isSome auctionVisibleToA)
 
-  -- Step 5: Lenders submit sealed bids with commit-reveal
-  -- Lender A: pre-revealed for simplicity (3% discount)
+  -- Step 5: Lenders submit sealed bids using commit-reveal flow
+  -- Phase 1: COMMIT — lenders submit hash commitments, discountRate = 0
+  -- (In production, commitHash = SHA-256(rate + nonce), computed off-chain)
+
+  -- Lender A commits (will reveal 3% discount)
   bidA <- submitMulti [operator, lenderA] [] do
     createCmd SealedBid with
       operator
       lender = lenderA
       invoiceId = "INV-2026-001"
-      discountRate = 0.03
-      commitHash = "a1b2c3d4e5f6"
-      revealed = True
+      discountRate = 0.0
+      commitHash = "sha256_of_0.03_and_nonceA"
+      revealed = False
 
-  -- Lender B: pre-revealed (2.5% discount — better for seller)
+  -- Lender B commits (will reveal 2.5% discount — better for seller)
   bidB <- submitMulti [operator, lenderB] [] do
     createCmd SealedBid with
       operator
       lender = lenderB
       invoiceId = "INV-2026-001"
-      discountRate = 0.025
-      commitHash = "b2c3d4e5f6a1"
-      revealed = True
+      discountRate = 0.0
+      commitHash = "sha256_of_0.025_and_nonceB"
+      revealed = False
 
-  -- Lender C: pre-revealed (4% discount)
+  -- Lender C commits (will reveal 4% discount)
   bidC <- submitMulti [operator, lenderC] [] do
     createCmd SealedBid with
       operator
       lender = lenderC
       invoiceId = "INV-2026-001"
-      discountRate = 0.04
-      commitHash = "c3d4e5f6a1b2"
-      revealed = True
+      discountRate = 0.0
+      commitHash = "sha256_of_0.04_and_nonceC"
+      revealed = False
 
   -- PRIVACY CHECK: Lender A should NOT be able to see Lender B's bid
   -- Canton enforces this at the protocol level.
@@ -107,7 +110,24 @@ fullFlowTest = script do
   closedAuctionCid <- submit seller do
     exerciseCmd auctionCid CloseAuction with dummy = ()
 
-  -- Step 7: Operator evaluates bids and selects winner (lowest discount rate)
+  -- Phase 2: REVEAL — lenders reveal actual rates after auction closes
+  -- (Backend verifies SHA-256(rate + nonce) == commitHash before accepting)
+  bidA <- submit lenderA do
+    exerciseCmd bidA Reveal with actualRate = 0.03, nonce = "nonceA"
+  bidB <- submit lenderB do
+    exerciseCmd bidB Reveal with actualRate = 0.025, nonce = "nonceB"
+  bidC <- submit lenderC do
+    exerciseCmd bidC Reveal with actualRate = 0.04, nonce = "nonceC"
+
+  -- Verify bids are now revealed with correct rates
+  bidAOpt <- queryContractId lenderA bidA
+  case bidAOpt of
+    None -> assertFail "Revealed bid A should be visible to lender A"
+    Some ba -> do
+      assertMsg "Bid A should be revealed" ba.revealed
+      assertMsg "Bid A rate should be 0.03" (ba.discountRate == 0.03)
+
+  -- Step 7: Operator evaluates revealed bids and selects winner (lowest discount rate)
   -- Winner: Lender B at 2.5%
   resultCid <- submitMulti [operator, seller] [] do
     createCmd AuctionResult with

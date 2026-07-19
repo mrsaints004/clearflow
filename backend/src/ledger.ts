@@ -58,10 +58,11 @@ export interface InvoiceMetadata {
 export interface SealedBid {
   lender: string;
   invoiceId: string;
-  discountRate: number;
+  discountRate: number;    // 0 until revealed
   commitHash?: string;
   nonce?: string;
   verified?: boolean;
+  revealed?: boolean;      // true after lender reveals rate + nonce
 }
 
 export interface AuctionState {
@@ -132,7 +133,8 @@ export interface PortfolioAuction {
 }
 
 // Cross-currency exchange rates (mid-market, relative to USD)
-const FX_RATES: Record<string, number> = {
+// These are fallback rates used when live rates are unavailable.
+const FALLBACK_FX_RATES: Record<string, number> = {
   USD: 1.0,
   EUR: 1.08,
   GBP: 1.27,
@@ -145,9 +147,40 @@ const FX_RATES: Record<string, number> = {
   CNY: 0.138,
 };
 
+let liveFxRates: Record<string, number> | null = null;
+let fxLastFetched = 0;
+const FX_CACHE_TTL = 3600_000; // 1 hour
+
+async function fetchLiveFxRates(): Promise<void> {
+  if (Date.now() - fxLastFetched < FX_CACHE_TTL && liveFxRates) return;
+  try {
+    // Open Exchange Rates free tier (no key needed for latest.json via frankfurter)
+    const resp = await fetch("https://api.frankfurter.app/latest?from=USD");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json() as { rates: Record<string, number> };
+    // Frankfurter returns rates as "1 USD = X foreign", we need "1 foreign = X USD"
+    const rates: Record<string, number> = { USD: 1.0 };
+    for (const [cur, rate] of Object.entries(data.rates)) {
+      rates[cur] = 1 / rate; // invert: how many USD per 1 unit of foreign currency
+    }
+    liveFxRates = rates;
+    fxLastFetched = Date.now();
+    console.log(`[FX] Updated live rates for ${Object.keys(rates).length} currencies`);
+  } catch (e: any) {
+    console.warn(`[FX] Failed to fetch live rates, using fallback: ${e.message}`);
+  }
+}
+
+// Call on startup (non-blocking)
+fetchLiveFxRates();
+
+function getFxRate(currency: string): number {
+  if (liveFxRates && currency in liveFxRates) return liveFxRates[currency];
+  return FALLBACK_FX_RATES[currency] || 1.0;
+}
+
 function toUSD(amount: number, currency: string): number {
-  const rate = FX_RATES[currency] || 1.0;
-  return amount * rate;
+  return amount * getFxRate(currency);
 }
 
 function computeNetting(invoices: InvoiceData[]): NettingResult {
@@ -274,7 +307,8 @@ function computeRiskScore(invoice: InvoiceData, debtorHistory: { totalInvoices: 
   });
 
   // Factor 6: Temporal proximity (weight: 0.10) — closer due date is lower risk
-  const daysUntilDue = Math.max(1, Math.round((new Date(invoice.dueDate).getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
+  const dueDateMs = Date.parse(invoice.dueDate + (invoice.dueDate.includes("T") ? "" : "T00:00:00Z"));
+  const daysUntilDue = Math.max(1, Math.round(((isNaN(dueDateMs) ? Date.now() : dueDateMs) - Date.now()) / (1000 * 60 * 60 * 24)));
   const temporalScore = Math.max(0, Math.min(100, 100 - (daysUntilDue - 30) * 0.8));
   factors.push({
     name: "Temporal Proximity",
@@ -384,10 +418,11 @@ class StandaloneLedger {
       this.parties.push({ displayName: "Operator", role: "operator", partyId: generatePartyId("Operator"), registeredAt: new Date().toISOString() });
       persistToFile("ledger-parties", this.parties);
     }
-    // Backfill partyId for parties loaded from disk that don't have one
+    // Backfill partyId for legacy parties loaded from disk that don't have one
     let backfilled = false;
     for (const p of this.parties) {
       if (!p.partyId) {
+        console.warn(`[Ledger] Party "${p.displayName}" missing partyId — generating one. This party's ID will differ from any Canton-allocated ID.`);
         p.partyId = generatePartyId(p.displayName);
         backfilled = true;
       }
@@ -531,30 +566,63 @@ class StandaloneLedger {
     return Array.from(this.auctions.values());
   }
 
-  submitBid(bid: SealedBid): SealedBid | null {
+  submitBid(bid: { lender: string; invoiceId: string; commitHash: string }): SealedBid | null {
     const auction = this.auctions.get(bid.invoiceId);
     if (!auction || auction.status !== "open") return null;
     // Prevent duplicate bids from same lender
     if (auction.bids.some((b) => b.lender === bid.lender)) return null;
+    if (!bid.commitHash || bid.commitHash.length !== 64) return null;
 
-    // Generate cryptographic commitment: SHA-256(rate + nonce)
-    const nonce = generateNonce();
-    const commitHash = computeBidCommitment(bid.discountRate, nonce);
     const sealedBid: SealedBid = {
-      ...bid,
-      commitHash,
-      nonce,
+      lender: bid.lender,
+      invoiceId: bid.invoiceId,
+      discountRate: 0,  // hidden until reveal
+      commitHash: bid.commitHash,
       verified: false,
+      revealed: false,
     };
     auction.bids.push(sealedBid);
 
     this.auditChain.append("SUBMIT_BID", bid.lender, {
       invoiceId: bid.invoiceId,
-      commitHash,
+      commitHash: bid.commitHash,
     });
 
     this.persist();
     return sealedBid;
+  }
+
+  revealBid(invoiceId: string, lender: string, discountRate: number, nonce: string): SealedBid | null {
+    const auction = this.auctions.get(invoiceId);
+    if (!auction) return null;
+    // Can only reveal after auction is closed
+    if (auction.status !== "closed") return null;
+
+    const bid = auction.bids.find((b) => b.lender === lender);
+    if (!bid || !bid.commitHash) return null;
+    if (bid.revealed) return null; // already revealed
+
+    // Verify commitment: SHA-256(rate + nonce) must match commitHash
+    if (!verifyBidCommitment(discountRate, nonce, bid.commitHash)) {
+      return null; // commitment mismatch — reject
+    }
+
+    // Rate bounds check
+    if (discountRate <= 0 || discountRate >= 1) return null;
+
+    bid.discountRate = discountRate;
+    bid.nonce = nonce;
+    bid.verified = true;
+    bid.revealed = true;
+
+    this.auditChain.append("REVEAL_BID", lender, {
+      invoiceId,
+      commitHash: bid.commitHash,
+      verified: true,
+    });
+
+    this.persist();
+    return bid;
   }
 
   // Get bids visible to a specific party (privacy enforcement)
@@ -570,23 +638,34 @@ class StandaloneLedger {
     if (!auction || auction.status !== "open") return null;
     if (auction.bids.length < 2) return null; // Min 2 bids required
 
-    // Verify all bid commitments (reveal phase)
-    for (const bid of auction.bids) {
-      if (bid.commitHash && bid.nonce) {
-        bid.verified = verifyBidCommitment(bid.discountRate, bid.nonce, bid.commitHash);
-      }
-    }
-
+    // Close the auction — lenders now have a window to reveal bids
     auction.status = "closed";
 
+    this.auditChain.append("CLOSE_AUCTION", seller, {
+      invoiceId,
+      bidCount: auction.bids.length,
+    });
+
+    this.persist();
+    return auction;
+  }
+
+  /** After all bids are revealed, finalize the auction and select the winner. */
+  finalizeAuction(invoiceId: string): AuctionState | null {
+    const auction = this.auctions.get(invoiceId);
+    if (!auction || auction.status !== "closed") return null;
+
+    // All bids must be revealed before finalizing
+    const unrevealed = auction.bids.filter((b) => !b.revealed);
+    if (unrevealed.length > 0) return null;
+
     // Select winner: lowest discount rate = best for seller
-    // On tie, first bid submitted wins (earlier index = earlier submission)
     const sorted = [...auction.bids].sort((a, b) => a.discountRate - b.discountRate);
     const winner = sorted[0];
     auction.winningLender = winner.lender;
     auction.winningRate = winner.discountRate;
 
-    this.auditChain.append("CLOSE_AUCTION", seller, {
+    this.auditChain.append("FINALIZE_AUCTION", "Operator", {
       invoiceId,
       bidCount: auction.bids.length,
       winningLender: auction.winningLender,
@@ -663,6 +742,11 @@ class StandaloneLedger {
   getRiskScore(invoiceId: string): RiskScore | null {
     const inv = this.invoices.get(invoiceId);
     if (!inv) return null;
+    // Return cached score if computed within the last 60 seconds
+    if (inv.riskScore && inv.riskScore.computedAt) {
+      const age = Date.now() - new Date(inv.riskScore.computedAt).getTime();
+      if (age < 60_000) return inv.riskScore;
+    }
     // Recompute with latest debtor history
     const history = this.getDebtorHistory(inv.debtor);
     const score = computeRiskScore(inv, history);
@@ -725,7 +809,7 @@ class StandaloneLedger {
       if (this.auctions.has(id)) return null; // Already in individual auction
       invoices.push(inv);
     }
-    if (invoices.length < 2) return null; // Need at least 2 invoices
+    if (invoices.length < 2 || invoices.length > 50) return null; // Need 2-50 invoices
 
     const totalAmount = invoices.reduce((sum, inv) => sum + inv.amount, 0);
     const weightedRisk = invoices.reduce((sum, inv) => {
@@ -928,10 +1012,10 @@ function computeRiskScoreFromData(data: any): any {
     invoiceId: data.invoiceId || "",
     seller: data.seller || "",
     debtor: data.debtor || "",
-    amount: typeof data.amount === "number" ? data.amount : parseFloat(data.amount) || 0,
+    amount: typeof data.amount === "number" ? data.amount : (parseFloat(data.amount) || 0),
     currency: data.currency || "USD",
     sector: data.sector || "Other",
-    paymentTermDays: typeof data.paymentTermDays === "number" ? data.paymentTermDays : parseInt(data.paymentTermDays) || 30,
+    paymentTermDays: typeof data.paymentTermDays === "number" ? data.paymentTermDays : (parseInt(data.paymentTermDays, 10) || 30),
     issueDate: data.issueDate || new Date().toISOString(),
     dueDate: data.dueDate || new Date().toISOString(),
     reliabilityScore: data.reliabilityScore || "B",

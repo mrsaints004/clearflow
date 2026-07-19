@@ -6,16 +6,27 @@ export function hashInvoiceDocument(invoice: {
   debtor: string;
   amount: number;
   currency: string;
+  sector?: string;
+  paymentTermDays?: number;
+  issueDate?: string;
   dueDate: string;
+  reliabilityScore?: string;
 }): string {
-  const canonical = JSON.stringify({
-    invoiceId: invoice.invoiceId,
-    seller: invoice.seller,
-    debtor: invoice.debtor,
+  // Deterministic serialization: sorted keys ensure consistent hashes
+  // regardless of object property insertion order
+  const fields: Record<string, string | number> = {
     amount: invoice.amount,
     currency: invoice.currency,
+    debtor: invoice.debtor,
     dueDate: invoice.dueDate,
-  });
+    invoiceId: invoice.invoiceId,
+    issueDate: invoice.issueDate || "",
+    paymentTermDays: invoice.paymentTermDays || 0,
+    reliabilityScore: invoice.reliabilityScore || "",
+    sector: invoice.sector || "",
+    seller: invoice.seller,
+  };
+  const canonical = JSON.stringify(fields, Object.keys(fields).sort());
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
@@ -49,6 +60,43 @@ export interface AuditEntry {
 export class AuditChain {
   private entries: AuditEntry[] = [];
   private headHash: string = "0".repeat(64); // Genesis hash
+  private onPersist?: (entries: AuditEntry[]) => void;
+
+  constructor(opts?: { onPersist?: (entries: AuditEntry[]) => void }) {
+    if (opts?.onPersist) this.onPersist = opts.onPersist;
+  }
+
+  /** Load previously persisted entries. Validates chain integrity before accepting. */
+  load(entries: AuditEntry[]): void {
+    if (!entries || entries.length === 0) return;
+
+    // Verify the loaded chain is valid before accepting it
+    let expectedPrev = "0".repeat(64);
+    for (const entry of entries) {
+      if (entry.prevHash !== expectedPrev) {
+        console.warn(`[AuditChain] Corrupted persisted chain at entry ${entry.sequenceNumber} — starting fresh`);
+        return;
+      }
+      const payload = JSON.stringify({
+        sequenceNumber: entry.sequenceNumber,
+        timestamp: entry.timestamp,
+        action: entry.action,
+        party: entry.party,
+        data: entry.data,
+        prevHash: entry.prevHash,
+      });
+      const computed = crypto.createHash("sha256").update(payload).digest("hex");
+      if (computed !== entry.hash) {
+        console.warn(`[AuditChain] Hash mismatch at entry ${entry.sequenceNumber} — starting fresh`);
+        return;
+      }
+      expectedPrev = entry.hash;
+    }
+
+    this.entries = entries;
+    this.headHash = entries[entries.length - 1].hash;
+    console.log(`[AuditChain] Restored ${entries.length} audit entries from disk`);
+  }
 
   append(action: string, party: string, data: Record<string, any>): AuditEntry {
     const sequenceNumber = this.entries.length;
@@ -77,6 +125,16 @@ export class AuditChain {
 
     this.entries.push(entry);
     this.headHash = hash;
+
+    // Persist to disk
+    if (this.onPersist) {
+      try {
+        this.onPersist(this.entries);
+      } catch (e) {
+        console.error("[AuditChain] Persistence failed:", e);
+      }
+    }
+
     return entry;
   }
 
@@ -116,5 +174,12 @@ export class AuditChain {
   reset(): void {
     this.entries = [];
     this.headHash = "0".repeat(64);
+    if (this.onPersist) {
+      try {
+        this.onPersist([]);
+      } catch (e) {
+        console.error("[AuditChain] Persistence reset failed:", e);
+      }
+    }
   }
 }

@@ -57,6 +57,7 @@ function App() {
 
   useEffect(() => {
     if (!authSession) return;
+    let pollFailures = 0;
     const interval = setInterval(async () => {
       try {
         const auctions = await apiClient.getAuctions() as any[];
@@ -71,8 +72,14 @@ function App() {
         } else {
           setCurrentInvoiceStatus(null);
         }
-      } catch {}
-    }, 3000);
+        pollFailures = 0;
+      } catch {
+        pollFailures++;
+        if (pollFailures >= 3) {
+          console.warn("Polling failed 3+ times — backend may be unreachable");
+        }
+      }
+    }, 15000);
     return () => clearInterval(interval);
   }, [authSession]);
 
