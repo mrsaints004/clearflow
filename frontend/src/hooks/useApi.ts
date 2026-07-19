@@ -20,10 +20,17 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+    const err = await res.json().catch(() => ({ error: res.statusText || "Request failed" }));
+    const msg = typeof err === "string" ? err : (err?.error || err?.message || res.statusText || "Request failed");
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
-  return res.json();
+  const text = await res.text();
+  if (!text) return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error("Invalid JSON response from server");
+  }
 }
 
 export const apiClient = {

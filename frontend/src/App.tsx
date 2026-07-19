@@ -142,6 +142,23 @@ function App() {
     }
   }, [authSession?.role]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Keyboard shortcuts for instant role switching during demo
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!authSession) return;
+      // Don't capture if user is typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return;
+      switch (e.key) {
+        case "1": setActiveView("seller"); break;
+        case "2": setActiveView("lender"); break;
+        case "3": setActiveView("operator"); break;
+        case "4": setActiveView("debtor"); break;
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [authSession]);
+
   const handleSignOut = () => {
     clearAuthToken();
     setAuthSession(null);
@@ -261,6 +278,7 @@ function App() {
                 <label>
                   <span>Role</span>
                   <select value={regRole} onChange={(e) => setRegRole(e.target.value)}>
+                    <option value="operator">Operator</option>
                     <option value="seller">Seller</option>
                     <option value="lender">Lender</option>
                     <option value="debtor">Debtor</option>
@@ -412,21 +430,20 @@ function App() {
         </div>
       </header>
 
-      {authSession.role !== "operator" && (
-        <div className="role-switcher">
-          <span className="role-switcher-hint">View as:</span>
-          {(["seller", "lender", "debtor"] as const).map((r) => (
-            <button
-              key={r}
-              className={`role-switcher-btn ${resolvedRole === r ? "active" : ""}`}
-              onClick={() => setActiveView(r)}
-            >
-              {r.charAt(0).toUpperCase() + r.slice(1)}
-              {r === authSession.role && <span className="role-switcher-primary">primary</span>}
-            </button>
-          ))}
-        </div>
-      )}
+      <div className="role-switcher">
+        <span className="role-switcher-hint">View as:</span>
+        {(["seller", "lender", "operator", "debtor"] as const).map((r, i) => (
+          <button
+            key={r}
+            className={`role-switcher-btn ${resolvedRole === r ? "active" : ""}`}
+            onClick={() => setActiveView(r)}
+          >
+            <span className="role-switcher-key">{i + 1}</span>
+            {r.charAt(0).toUpperCase() + r.slice(1)}
+            {r === authSession.role && <span className="role-switcher-primary">primary</span>}
+          </button>
+        ))}
+      </div>
 
       {showDemoGuide && (
         <div className="demo-guide">

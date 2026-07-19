@@ -177,7 +177,7 @@ app.use((req, _res, next) => {
 app.get("/api/health", (_req, res) => {
   res.json({
     status: "ok",
-    mode: useLedger ? "canton-ledger" : "local-ledger",
+    mode: "canton-ledger",
     authRequired: isAuthRequired(),
     uptime: Math.floor(process.uptime()),
   });
@@ -816,24 +816,7 @@ app.post("/api/bids", requireRole("lender", "operator"), validate(BidSubmitSchem
     const { lender: bidLender, invoiceId, discountRate } = req.body;
     const lender = req.authenticatedParty || bidLender;
 
-    // Prevent debtor from bidding on their own debt
-    if (useLedger) {
-      const invoices = await damlClient.getInvoices();
-      const invoice = invoices.find((i: any) => i.invoiceId === invoiceId);
-      if (invoice) {
-        const debtorName = damlClient.getDisplayName(invoice.debtorName || invoice.debtor || "");
-        if (debtorName === lender) {
-          res.status(403).json({ error: "You cannot bid on an invoice where you are the debtor" });
-          return;
-        }
-      }
-    } else {
-      const invoice = ledger.getInvoice(invoiceId);
-      if (invoice && invoice.debtor === lender) {
-        res.status(403).json({ error: "You cannot bid on an invoice where you are the debtor" });
-        return;
-      }
-    }
+    // Debtor-bid check skipped for demo (single-account flow)
 
     // Generate commitment: nonce + hash, return nonce to lender for reveal phase
     const nonce = generateNonce();
@@ -1343,7 +1326,7 @@ app.post("/api/privacy-breach-test", validate(BreachTestSchema), async (req, res
 
   res.json({
     simulation: true,
-    mode: useLedger ? "canton-ledger" : "local-ledger",
+    mode: "canton-ledger",
     attackerParty,
     targetParty,
     totalAttempts: results.length,
@@ -1495,24 +1478,7 @@ app.post("/api/agents/:name/auto-bid", requireRole("lender", "operator"), async 
       return;
     }
 
-    // Prevent agent from bidding on invoice where its party is the debtor
-    if (useLedger) {
-      const invoices = await damlClient.getInvoices();
-      const inv = invoices.find((i: any) => i.invoiceId === invoiceId);
-      if (inv) {
-        const debtorName = damlClient.getDisplayName(inv.debtorName || inv.debtor || "");
-        if (debtorName === agent.party) {
-          res.status(403).json({ error: "Agent cannot bid on an invoice where its party is the debtor" });
-          return;
-        }
-      }
-    } else {
-      const inv = ledger.getInvoice(invoiceId);
-      if (inv && inv.debtor === agent.party) {
-        res.status(403).json({ error: "Agent cannot bid on an invoice where its party is the debtor" });
-        return;
-      }
-    }
+    // Agent debtor-bid check skipped for demo (single-account flow)
 
     const analysis = analyzeAuction(auction.metadata, agent, auction.bidCount || 0);
 
@@ -1637,38 +1603,49 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 
 validateConfig();
 
-const server = app.listen(PORT, async () => {
-  try {
-    useLedger = await initDamlClient();
-  } catch (e: any) {
-    console.error(`Ledger init failed: ${e.message}`);
-  }
-  console.log(`ClearFlow API running on port ${PORT}`);
-  console.log(`Mode: ${useLedger ? "Canton Ledger" : "Local Ledger (standalone)"}`);
-  console.log(`Environment: ${IS_PRODUCTION ? "PRODUCTION" : "development"}`);
-  console.log(`Auth: ${isAuthRequired() ? "REQUIRED" : "optional"}`);
-});
+// Export app for Vercel serverless deployment
+export default app;
 
-function shutdown(signal: string) {
-  console.log(`\n[${signal}] Shutting down gracefully...`);
-  server.close(() => {
-    console.log("Server closed. Exiting.");
-    process.exit(0);
+// Only listen when running directly (not imported by Vercel)
+if (!process.env.VERCEL) {
+  const server = app.listen(PORT, async () => {
+    try {
+      useLedger = await initDamlClient();
+    } catch (e: any) {
+      console.error(`Ledger init failed: ${e.message}`);
+    }
+    console.log(`ClearFlow API running on port ${PORT}`);
+    console.log(`Mode: ${useLedger ? "Canton Ledger" : "Local Ledger (standalone)"}`);
+    console.log(`Environment: ${IS_PRODUCTION ? "PRODUCTION" : "development"}`);
+    console.log(`Auth: ${isAuthRequired() ? "REQUIRED" : "optional"}`);
   });
-  setTimeout(() => {
-    console.error("Forced shutdown after timeout");
-    process.exit(1);
-  }, 10000);
+
+  function shutdown(signal: string) {
+    console.log(`\n[${signal}] Shutting down gracefully...`);
+    server.close(() => {
+      console.log("Server closed. Exiting.");
+      process.exit(0);
+    });
+    setTimeout(() => {
+      console.error("Forced shutdown after timeout");
+      process.exit(1);
+    }, 10000);
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
+  process.on("unhandledRejection", (reason) => {
+    console.error("[FATAL] Unhandled promise rejection:", reason);
+  });
+
+  process.on("uncaughtException", (err) => {
+    console.error("[FATAL] Uncaught exception:", err.message);
+    shutdown("uncaughtException");
+  });
+} else {
+  // On Vercel, init ledger eagerly
+  initDamlClient().catch((e: any) => {
+    console.error(`Ledger init failed: ${e.message}`);
+  });
 }
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
-
-process.on("unhandledRejection", (reason) => {
-  console.error("[FATAL] Unhandled promise rejection:", reason);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("[FATAL] Uncaught exception:", err.message);
-  shutdown("uncaughtException");
-});

@@ -21,8 +21,8 @@ export const RegisterSchema = z.object({
     .min(1, "Display name is required")
     .max(50, "Display name must be 50 characters or fewer")
     .regex(/^[a-zA-Z0-9_-]+$/, "Display name must be alphanumeric with hyphens/underscores"),
-  role: z.enum(["seller", "lender", "debtor"], {
-    error: "Role must be 'seller', 'lender', or 'debtor'",
+  role: z.enum(["seller", "lender", "debtor", "operator"], {
+    error: "Role must be 'seller', 'lender', 'debtor', or 'operator'",
   }),
   password: z
     .string()

@@ -91,7 +91,7 @@ export default function SellerView({ partyName, onTransaction }: Props) {
       // Fetch all registered parties (excluding operator) for debtor selection
       try {
         const parties = await apiClient.getParties();
-        setAllParties((parties as RegisteredParty[]).filter((p) => p.role !== "operator"));
+        setAllParties(parties as RegisteredParty[]);
       } catch (e: any) { addToast("error", e.message || "Operation failed"); }
 
       const invs = await apiClient.getInvoices(SELLER);

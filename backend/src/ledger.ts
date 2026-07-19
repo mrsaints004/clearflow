@@ -348,7 +348,9 @@ function toMetadata(inv: InvoiceData): InvoiceMetadata {
   };
 }
 
-const DATA_DIR = path.join(__dirname, "..", "data");
+const DATA_DIR = process.env.VERCEL
+  ? path.join("/tmp", "clearflow-data")
+  : path.join(__dirname, "..", "data");
 
 function ensureDataDir(): void {
   if (!fs.existsSync(DATA_DIR)) {

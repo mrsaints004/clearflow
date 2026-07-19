@@ -8,7 +8,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production";
 // In production, auth is required unless explicitly disabled.
 // In development, auth is optional unless explicitly enabled.
 export function isAuthRequired(): boolean {
-  if (isAuthRequired()) return true;
+  if (process.env.REQUIRE_AUTH === "true") return true;
   if (process.env.REQUIRE_AUTH === "false") return false;
   return IS_PRODUCTION; // default: required in production, optional in dev
 }

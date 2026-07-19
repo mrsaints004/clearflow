@@ -305,12 +305,12 @@ Rate limited: 20 requests per 15 minutes.
 ```json
 { "displayName": "SellerCo", "role": "seller", "password": "min-8-chars" }
 ```
-**Roles:** `seller`, `lender`, `debtor`
+**Roles:** `seller`, `lender`, `debtor`, `operator`
 
 **Validation:**
 - displayName: 1-50 chars, alphanumeric + hyphens/underscores
 - password: 8-128 chars
-- role: must be one of seller, lender, debtor
+- role: must be one of seller, lender, debtor, operator
 
 ### Party Endpoints
 
@@ -745,6 +745,49 @@ When a portfolio contains invoices in multiple currencies:
 5. Net exposure = gross - netting benefit
 
 **Supported currencies:** USD, EUR, GBP, CHF, JPY, CAD, AUD, SGD, HKD, CNY
+
+---
+
+## 10b. Demo Mode (Single-Account Operation)
+
+### Overview
+
+For presentations and hackathon demos, ClearFlow supports single-account operation where one user can demonstrate all roles without signing in/out.
+
+### Setup
+
+1. Register as **Operator** (first option in the dropdown)
+2. The operator role has permissions for all backend endpoints (`requireRole` allows operator on every action)
+3. Use the role switcher bar or keyboard shortcuts to flip between views instantly
+
+### Keyboard Shortcuts
+
+| Key | View |
+|---|---|
+| `1` | Seller |
+| `2` | Lender |
+| `3` | Operator |
+| `4` | Debtor |
+
+Shortcuts are disabled when typing in input fields.
+
+### Single-Account Workflow
+
+1. Press `1` → Create an invoice (set yourself as debtor)
+2. Press `3` → Approve the invoice as operator
+3. Press `4` → Confirm the invoice as debtor
+4. Press `1` → Start a sealed auction
+5. Press `2` → Submit a sealed bid as lender
+6. Press `1` → Close the auction
+7. Press `2` → Settle as winning lender
+8. Press `3` → Run breach test to prove privacy guarantees
+
+### Design Decisions
+
+- The debtor-cannot-bid validation is relaxed in demo mode to allow single-account flow
+- The role switcher shows all 4 roles regardless of the authenticated user's primary role
+- Each role button displays its keyboard shortcut as a visual badge
+- View switching is instant (no re-authentication, no API calls)
 
 ---
 

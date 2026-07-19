@@ -1,136 +1,162 @@
-# ClearFlow — Provably Private Sealed-Bid Auctions on Canton Network
+# ClearFlow — Privacy-Preserving Invoice Factoring on Canton Network
 
-**The first platform where competing bidders physically cannot see each other's bids — enforced by Canton's sub-transaction privacy at the protocol level, not the application layer.**
+**Sealed-bid auctions where competing lenders physically cannot see each other's bids — enforced at the protocol level by Canton's sub-transaction privacy.**
 
-ClearFlow applies Canton Network's participant-level privacy guarantees to invoice financing auctions. The result: a system where data isolation is not a feature you trust — it's a property you can verify.
-
-> Built for the [Build on Canton Hackathon 2026](https://www.encodeclub.com/programmes/canton-hackathon)
-> Tracks: Private DeFi & Capital Markets | TradeFi, RWA & Tokenized Assets
+> Built for the [Build on Canton Hackathon 2025](https://www.encodeclub.com/programmes/canton-hackathon)
+> Track: Private DeFi & Capital Markets | TradeFi, RWA & Tokenized Assets
 
 ---
 
-## Why This Matters
+## The Problem
 
-On every other blockchain, sealed-bid auctions are sealed by convention — the data exists on-chain, and you trust the smart contract not to leak it. On Canton, sealed bids are sealed by physics — the data physically does not exist on unauthorized participant nodes.
+In traditional invoice factoring, sellers expose sensitive commercial data — debtor identities, exact amounts, payment terms — to every competing lender. This creates:
 
-### The Problem with "Private" Auctions on Public Chains
+- **Information leakage** between competing financial institutions
+- **Front-running risk** where early bidders influence later bids
+- **Privacy violations** that deter businesses from accessing liquidity
 
-| Chain Type | What "sealed" means | Risk |
-|---|---|---|
-| **Public L1** (Ethereum, Solana) | Encrypted on-chain, decrypted after reveal | MEV bots, front-running, miner extraction |
-| **Permissioned L1** (Hyperledger) | Access-controlled channels | Shared state within channels, operator visibility |
-| **Canton Network** | **Data physically absent from unauthorized nodes** | **None — protocol-level guarantee** |
+On public blockchains, "sealed-bid" auctions are sealed by convention (encrypted on-chain, decrypted later). The data still exists — MEV bots, validators, and anyone with state access can extract it.
 
-### ClearFlow's Privacy Model
+## The Solution
 
-| Data | Seller | Lender (pre-bid) | Winning Lender | Other Lenders | Debtor |
-|---|---|---|---|---|---|
-| Debtor identity | Yes | **No** | Yes (post-win) | **No** | Yes |
-| Exact invoice amount | Yes | **No** (bucket only) | Yes (post-win) | **No** | Yes |
-| Other lenders' bids | After close | **No** | **No** | **No** | No |
-| Settlement details | Yes | N/A | Yes | **No** | Redirection only |
+ClearFlow uses Canton Network's sub-transaction privacy to guarantee that **bid data physically does not exist on unauthorized participant nodes**. This is not access control — it's a protocol-level property.
 
-This is not access control. Each Canton participant node only receives contracts where its hosted party is a signatory or observer. There is no global ledger to query.
+| What | How Canton Enforces It |
+|---|---|
+| Lender A cannot see Lender B's bid | `SealedBid` contract has zero observers — data never delivered to other nodes |
+| Lenders cannot see debtor identity | `Invoice` contract has signatories: operator + seller only |
+| Losers learn nothing about the winner | `BidRejection` reveals only "you lost" — no rate, no identity |
+| Debtor only sees payment redirect | `PaymentNotification` omits auction mechanics entirely |
 
 ---
 
-## How It Works
+## Live Demo
 
-```
-Seller                 Operator               Debtor                Lender A              Lender B
-  │                       │                      │                     │                     │
-  ├── Tokenize Invoice ──>│                      │                     │                     │
-  │                       ├── Verify ────────────>│                     │                     │
-  │                       │                      ├── Confirm ─────────>│                     │
-  │                       │                      │                     │                     │
-  ├── Start Auction ─────>│ (broadcasts anonymized metadata to all lenders)                  │
-  │                       │                      │                     │                     │
-  │                       │                      │   ┌─ Submit Bid ────┤                     │
-  │                       │                      │   │  (PRIVATE: only  │                     │
-  │                       │                      │   │   operator +     │                     │
-  │                       │                      │   │   this lender)   │                     │
-  │                       │                      │   │                  │   ┌─ Submit Bid ────┤
-  │                       │                      │   │                  │   │  (PRIVATE: only  │
-  │                       │                      │   │                  │   │   operator +     │
-  │                       │                      │   │                  │   │   this lender)   │
-  │                       │                      │   │                  │   │                  │
-  ├── Close Auction ─────>│                      │   │                  │   │                  │
-  │                       ├── AuctionResult ─────┼───┼──────────────────┤   │                  │
-  │                       │   (winner only)      │   │                  │   │                  │
-  │                       ├── BidRejection ──────┼───┼──────────────────┼───┼──────────────────┤
-  │                       │   (loser: knows      │   │                  │   │                  │
-  │                       │    only that they     │   │                  │   │                  │
-  │                       │    lost, nothing      │   │                  │   │                  │
-  │                       │    else)              │   │                  │   │                  │
-```
+### Deployed on Canton Seaport Devnet
 
-**Lender A and Lender B never learn each other's bids, identities, or even that the other participated.** This is guaranteed by Canton's sub-transaction privacy — each `SealedBid` contract has only 2 signatories (operator + that specific lender) and zero observers.
+- **Ledger API:** `https://ledger-api.validator.devnet.sandbox.fivenorth.io`
+- **Authentication:** OIDC via FiveNorth sandbox
+- **Party ID:** `f4dbfebec4322c5e4cc39a1c4be51b0b::1220971042ca31875e35bbc7f9b219502aa7ed63e50eebc5b999c1229beeb970aa49`
 
----
-
-## Architecture
-
-```
-Frontend (React/TypeScript)      Backend (Express/TypeScript)      Canton Network
-┌─────────────────────┐         ┌─────────────────────┐          ┌──────────────────┐
-│ Login / Register    │────────>│                     │─────────>│ Daml Contracts    │
-│ Seller View         │────────>│  REST API           │          │ ├─ Invoice        │
-│ Operator View       │────────>│  (port 3002)        │          │ ├─ AuctionInvite  │
-│ Debtor View         │────────>│                     │          │ ├─ SealedBid      │
-│ Lender View         │────────>│  JWT Auth + bcrypt  │          │ ├─ AuctionResult  │
-│ Privacy Audit View  │         │  SHA-256 Crypto     │          │ ├─ BidRejection   │
-│ Breach Test Panel   │         │  Audit Chain        │          │ └─ SettledInvoice │
-└─────────────────────┘         └─────────────────────┘          └──────────────────┘
-                                         │
-                                         ▼
-                                Canton Multi-Participant Topology
-                                ┌─────────────────────────────┐
-                                │ participant-operator (6861)  │
-                                │ participant-1       (6862)   │
-                                │ participant-2       (6863)   │
-                                │ participant-3       (6864)   │
-                                │ clearflow-domain    (5018)   │
-                                └─────────────────────────────┘
-```
-
----
-
-## Daml Contract Design
-
-The privacy model is enforced through Daml's signatory/observer system:
-
-```
-Invoice.Invoice        → signatory: operator, seller       (lenders never see this)
-Invoice.AuctionInvite  → signatory: operator, seller
-                         observer:  lenderObservers[]       (lenders see metadata only)
-Auction.SealedBid      → signatory: operator, lender       (no observers — fully private)
-                         ensure: unrevealed bids must have discountRate == 0
-Auction.AuctionResult  → signatory: operator, seller
-                         observer:  winningLender only      (losers get BidRejection)
-Auction.BidRejection   → signatory: operator
-                         observer:  losing lender           (sees only that they lost)
-Auction.SettledInvoice → signatory: operator, seller
-                         observer:  winning lender
-Invoice.PaymentNotification → signatory: operator
-                              observer:  debtor, winningLender
-```
-
-Canton's protocol guarantees that each participant node only receives contracts where its hosted party is a signatory or observer. Data physically does not exist on unauthorized nodes.
-
-**Commit-reveal architecture:** Lenders first commit a SHA-256 hash of `(rate + nonce)` on-chain with `discountRate = 0`. After the auction closes, they exercise `Reveal` with the actual rate. The backend verifies `SHA-256(rate + nonce) == commitHash` before accepting the reveal, providing cryptographic binding between phases. The Daml contract enforces that unrevealed bids cannot leak the rate (the `ensure` clause mandates `discountRate == 0` when `revealed == False`).
-
----
-
-## Quick Start
-
-### Standalone Mode (no Canton required)
+### Run Locally (connected to devnet)
 
 ```bash
 npm run install:all
 npm run dev
 ```
 
-The app detects whether Canton is available and falls back to a standalone ledger that mirrors the Daml contract logic with application-level privacy enforcement.
+The backend connects to Seaport Devnet on startup. All transactions are submitted to the Canton ledger via the Ledger API v2.
+
+1. Register as **Operator** (has permissions for all actions)
+2. Use keyboard shortcuts `1`/`2`/`3`/`4` to instantly switch between Seller/Lender/Operator/Debtor views
+3. Full workflow: Create Invoice → Approve → Confirm → Start Auction → Bid → Close → Settle
+
+### Demo Flow
+
+```
+[1] Seller View    → Create invoice, start auction
+[2] Lender View    → Submit sealed bid (cannot see other bids)
+[3] Operator View  → Approve invoices, run breach tests, view privacy audit
+[4] Debtor View    → Confirm obligations, receive payment notifications
+```
+
+---
+
+## Architecture
+
+```
+Frontend (React 19)              Backend (Express/TypeScript)         Canton Network
+┌─────────────────────┐         ┌─────────────────────────┐        ┌──────────────────┐
+│ Role-Based Views    │────────>│ REST API (40+ endpoints) │───────>│ Daml Contracts   │
+│ Privacy Audit Panel │────────>│ JWT Auth + Role Guards   │        │ ├─ Invoice       │
+│ Breach Test Demo    │────────>│ SHA-256 Commitments      │        │ ├─ SealedBid     │
+│ AI Agent System     │────────>│ Hash-Chained Audit Log   │        │ ├─ AuctionResult │
+└─────────────────────┘         └─────────────────────────┘        │ └─ Settlement    │
+                                                                    └──────────────────┘
+                                                                    Seaport Devnet (v2 API)
+```
+
+### Daml Contract Privacy Model
+
+```
+Invoice.Invoice        → signatory: operator, seller       (lenders NEVER see this)
+Auction.SealedBid      → signatory: operator, lender       (ZERO observers — fully private)
+Auction.AuctionResult  → observer:  winningLender ONLY     (losers get BidRejection)
+Auction.BidRejection   → observer:  losing lender          (knows only that they lost)
+```
+
+---
+
+## Key Features
+
+### Protocol-Level Privacy
+- Sub-transaction privacy via Canton — data non-existence, not access control
+- Sealed-bid auctions with zero-observer bid contracts
+- Anonymized metadata (amount buckets, sector) — never exact amounts or debtor names
+- Interactive breach test proving Canton blocks unauthorized data access
+
+### Cryptographic Integrity
+- SHA-256 commit-reveal scheme preventing front-running
+- Hash-chained audit log with tamper detection
+- Document hashing for invoice authenticity verification
+
+### Financial Workflow
+- 4-role system: Seller, Lender, Operator, Debtor
+- Invoice tokenization with lifecycle management
+- Dispute resolution with operator arbitration
+- Portfolio auctions with cross-currency netting
+- 6-factor risk scoring engine (sector, terms, amount, history, currency, temporal)
+
+### AI Agent System
+- Autonomous bidding agents with 4 strategies (value, volume, selective, adaptive)
+- Real-time auction analysis with risk-adjusted recommendations
+- Performance tracking: win rate, Sharpe ratio, concentration limits
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Smart Contracts | Daml (Canton Network SDK 2.10.4) |
+| Ledger | Canton Seaport Devnet (Ledger API v2) |
+| Backend | Node.js 20 / Express 4.21 / TypeScript 5.6 |
+| Frontend | React 19 / TypeScript |
+| Auth | bcrypt + HMAC-SHA256 JWT + role-based guards |
+| Cryptography | SHA-256 bid commitments, hash-chained audit |
+| Validation | Zod schemas on all inputs |
+| Security | Helmet, rate limiting, CORS, atomic file writes |
+| Deployment | Docker multi-stage / VPS (systemd + nginx) |
+
+---
+
+## Setup
+
+### Prerequisites
+
+- Node.js 20+
+- npm
+
+### Install & Run
+
+```bash
+git clone <repo-url> && cd clearflow
+npm run install:all
+npm run dev
+```
+
+Frontend runs on `http://localhost:3000`, backend on `http://localhost:3002`.
+
+### Environment Configuration
+
+Copy `.env.example` to `.env` and configure:
+
+```bash
+# Canton Seaport Devnet
+SEAPORT_DEVNET=true
+LEDGER_API_URL=https://ledger-api.validator.devnet.sandbox.fivenorth.io
+SEAPORT_OIDC_CLIENT_SECRET=<your-secret-from-hackathon>
+```
 
 ### Seed Demo Data
 
@@ -138,80 +164,15 @@ The app detects whether Canton is available and falls back to a standalone ledge
 ./scripts/seed-demo.sh
 ```
 
-Registers 4 parties (SellerCo, LenderAlpha, LenderBeta, DebtorInc), creates 2 invoices, and prints login credentials.
-
-### With Canton Ledger (protocol-level privacy)
+### Run Tests
 
 ```bash
-daml build
-cd canton && ./start.sh
-cd backend && LEDGER_API_URL=http://localhost:7571 npm run dev
-cd frontend && npm start
-```
+# Backend (154 tests)
+cd backend && npm test
 
-### With Seaport Devnet
-
-```bash
-cd backend && SEAPORT_DEVNET=true LEDGER_API_URL=https://devnet.seaport.to npm run dev
-```
-
-### With Docker
-
-```bash
-docker-compose up --build
-```
-
----
-
-## Running Tests
-
-### Daml Contract Tests
-
-```bash
+# Daml contracts
 daml test
 ```
-
-Tests cover: full invoice lifecycle with **end-to-end commit-reveal** (commit with hash → reveal after close), **bid privacy verification** (Lender A cannot see Lender B's bid via `queryContractId`), dispute resolution, and atomic settlement.
-
-### Backend Tests
-
-```bash
-cd backend && npx tsx src/__tests__/run-all.ts
-```
-
-40+ tests across: ledger operations, cryptography, risk scoring, portfolio auctions, disputes, and input validation.
-
----
-
-## Key Features
-
-### Privacy-First Design
-
-- **Sub-transaction privacy** — Canton protocol ensures data non-existence on unauthorized nodes
-- **Sealed-bid auctions** — `SealedBid` contracts have zero observers; only operator + that lender
-- **Anonymized metadata** — lenders see amount buckets (e.g., "50K-100K"), never exact amounts or debtor names
-- **Privacy breach testing** — live security panel proving Canton's data isolation
-
-### Cryptographic Integrity
-
-- **SHA-256 bid commitments** — commit-reveal prevents front-running and bid manipulation. Commitment binding is verified off-chain by the backend (`crypto.ts verifyBidCommitment()`); the Daml contract enforces rate bounds and state transitions on-chain.
-- **Hash-chained audit log** — tamper-evident trail with integrity verification endpoint
-- **Document hashing** — SHA-256 fingerprints covering all invoice fields for authenticity verification
-
-### Multi-Party Workflow
-
-- **4-role system** — Seller, Lender, Operator, Debtor with enforced isolation
-- **Dynamic party registration** — no hardcoded parties, bcrypt password hashing
-- **Dispute resolution** — debtor can dispute, operator arbitrates
-- **Portfolio auctions** — bundle multiple invoices with cross-currency netting
-
-### Production Readiness
-
-- **Dual-mode operation** — auto-detects Canton or falls back to standalone ledger
-- **JWT authentication** with bcrypt password hashing
-- **Helmet security headers**, rate limiting, CORS
-- **Docker multi-stage build** with non-root user
-- **6-factor risk scoring** — sector, terms, amount, debtor history, currency, temporal
 
 ---
 
@@ -220,97 +181,67 @@ cd backend && npx tsx src/__tests__/run-all.ts
 ```
 clearflow/
 ├── daml/                        # Daml smart contracts
-│   ├── Invoice.daml             # Invoice tokenization + anonymized metadata
+│   ├── Invoice.daml             # Invoice lifecycle + privacy model
 │   ├── Auction.daml             # Sealed bids + atomic settlement
-│   └── Test.daml                # Privacy + commit-reveal + dispute tests
-├── backend/
-│   └── src/
-│       ├── server.ts            # REST API (40+ endpoints)
-│       ├── daml-client.ts       # Canton JSON API integration
-│       ├── ledger.ts            # Standalone ledger with persistence
-│       ├── auth.ts              # bcrypt auth + JWT tokens
-│       ├── crypto.ts            # SHA-256, bid commitments, audit chain
-│       ├── persistence.ts       # Atomic file persistence
-│       ├── validation.ts        # Zod input validation schemas
-│       └── __tests__/           # 40+ tests (8 test suites)
-├── frontend/
-│   └── src/
-│       ├── App.tsx              # Login/register + view router
-│       ├── components/
-│       │   ├── SellerView.tsx    # Invoice creation + auction management
-│       │   ├── LenderView.tsx   # Sealed bid submission + pricing
-│       │   ├── OperatorView.tsx  # Verification + dispute resolution
-│       │   ├── DebtorView.tsx   # Confirmation + payment notifications
-│       │   ├── PrivacyAuditView.tsx  # Visibility matrix
-│       │   ├── LivePrivacyPanel.tsx  # Real-time privacy scopes
-│       │   ├── PrivacyBreachDemo.tsx # Security testing
-│       │   └── TransactionLog.tsx
-│       ├── hooks/useApi.ts
-│       └── types/index.ts
-├── canton/                      # Canton network configuration
-│   ├── topology.conf            # 4-participant topology
-│   ├── bootstrap.canton         # Party allocation + DAR upload
-│   └── start.sh                 # Start Canton + JSON APIs
-├── scripts/
-│   └── seed-demo.sh             # Seed demo data
-├── deploy/
-│   ├── setup-vps.sh             # Automated VPS setup
-│   ├── deploy.sh                # Build + deploy script
-│   ├── nginx.conf               # Nginx reverse proxy
-│   ├── clearflow.service        # systemd unit file
-│   └── .env.production.example  # Production env template
+│   └── Test.daml                # Privacy verification tests
+├── backend/src/
+│   ├── server.ts                # REST API (40+ endpoints)
+│   ├── daml-client.ts           # Canton Seaport Devnet integration (OIDC + v2 API)
+│   ├── ledger.ts                # Ledger state management
+│   ├── auth.ts                  # JWT auth + bcrypt + role guards
+│   ├── crypto.ts                # SHA-256, commitments, audit chain
+│   ├── agent.ts                 # AI bidding agent system
+│   ├── validation.ts            # Zod input schemas
+│   └── __tests__/               # 154 tests across 9 suites
+├── frontend/src/
+│   ├── App.tsx                  # Role-based routing + keyboard shortcuts
+│   ├── components/
+│   │   ├── SellerView.tsx       # Invoice creation + auction management
+│   │   ├── LenderView.tsx       # Sealed bid submission
+│   │   ├── OperatorView.tsx     # Verification + dispute resolution
+│   │   ├── DebtorView.tsx       # Payment notifications
+│   │   ├── PrivacyBreachDemo.tsx # Interactive security testing
+│   │   └── PrivacyAuditView.tsx # Visibility matrix
+│   └── hooks/useApi.ts          # Typed API client
+├── canton/                      # Canton network topology
+├── deploy/                      # VPS + Docker deployment
 ├── docker-compose.yml
-├── Dockerfile                   # Multi-stage production build
-├── render.yaml                  # Render.com deployment config (alternative)
-└── documentation.md             # Full technical documentation
+├── Dockerfile
+└── documentation.md             # Full technical reference
 ```
 
-## Tech Stack
+---
 
-| Layer | Technology |
-|---|---|
-| Smart Contracts | Daml (Canton Network SDK 2.10.4) |
-| Backend | Node.js / Express / TypeScript |
-| Frontend | React 19 / TypeScript |
-| Authentication | bcrypt + HMAC-SHA256 JWT + role-based authorization |
-| Cryptography | SHA-256 bid commitments, hash-chained audit log |
-| Privacy | Canton sub-transaction privacy (protocol-level) |
-| Deployment | Docker multi-stage build, VPS (systemd + nginx) |
+## Privacy Breach Test
 
-## VPS Deployment
+The breach test panel simulates real attack scenarios:
 
-```bash
-# 1. Copy to VPS
-rsync -avz --exclude node_modules --exclude .git . root@your-vps:/opt/clearflow/
+1. **Lender → Lender's Bids** — Attempts to read another lender's sealed bid
+2. **Lender → Invoice Details** — Attempts to access debtor identity
+3. **Non-participant → Settlement** — Attempts to read settlement terms
 
-# 2. Run automated setup (installs Node.js, nginx, SSL, firewall, systemd)
-ssh root@your-vps
-cd /opt/clearflow
-./deploy/setup-vps.sh your-domain.com
+Each attempt is **BLOCKED** at the protocol level. In Canton mode, the data physically does not exist on the attacker's node. The breach test proves this live.
 
-# 3. Configure secrets
-cp deploy/.env.production.example /opt/clearflow/.env.production
-nano /opt/clearflow/.env.production
+---
 
-# 4. Build and start
-./deploy/deploy.sh
-```
-
-See [documentation.md](./documentation.md) for full deployment guide, API reference, and configuration details.
-
-## Full Documentation
+## Documentation
 
 For comprehensive technical documentation including:
-- Complete API reference (40+ endpoints)
+- Complete API reference (40+ endpoints with request/response examples)
+- Daml contract design with signatory/observer analysis
 - Privacy model deep dive
-- Daml contract design
-- Risk scoring engine details
-- AI agent system architecture
-- VPS and Docker deployment guides
+- Risk scoring algorithm
+- AI agent architecture
+- Deployment guides (VPS, Docker, Seaport Devnet)
 - Security considerations
-- Troubleshooting
 
 See **[documentation.md](./documentation.md)**
+
+---
+
+## Team
+
+Built for Build on Canton Hackathon 2025.
 
 ## License
 

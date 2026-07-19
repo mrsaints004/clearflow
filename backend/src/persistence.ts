@@ -3,7 +3,9 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 
-const DATA_DIR = path.join(__dirname, "..", "data");
+const DATA_DIR = process.env.VERCEL
+  ? path.join("/tmp", "clearflow-data")
+  : path.join(__dirname, "..", "data");
 
 const writeLocks = new Map<string, Promise<void>>();
 
