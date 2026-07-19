@@ -1,16 +1,27 @@
 {
-  "version": 2,
-  "installCommand": "npm run install:all",
-  "buildCommand": "cd frontend && npm run build",
-  "outputDirectory": "frontend/build",
-  "functions": {
-    "api/index.ts": {
-      "memory": 1024,
-      "maxDuration": 30,
-      "includeFiles": "backend/src/**"
+  "services": {
+    "frontend": {
+      "root": "frontend",
+      "framework": "create-react-app"
+    },
+    "backend": {
+      "root": "backend"
     }
   },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api" }
+    {
+      "source": "/api(/.+)",
+      "destination": {
+        "type": "service",
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "type": "service",
+        "service": "frontend"
+      }
+    }
   ]
 }
